@@ -1,0 +1,399 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap');
+
+* {
+  font-family: 'Inter', sans-serif;
+  background-color: #222;
+  color: #eee;
+}
+
+body {
+  margin: 0;
+  color: aliceblue;
+  background-color: #222;
+  font-family: sans-serif;
+}
+
+.titlebar {
+  height: 32px;
+  background: #222;
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px;
+
+  -webkit-app-region: drag; /* ✅ this makes it draggable */
+
+}
+
+.drag {
+  -webkit-app-region: drag;
+}
+
+.window-buttons button {
+  background: none;
+  border: none;
+  color: white;
+  width: 32px;
+  height: 32px;
+  cursor: pointer;
+
+  -webkit-app-region: no-drag; /* ✅ prevent buttons from being draggable */
+
+}
+
+.window-buttons button:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.search-bar {
+  padding: 1rem;
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+
+.always-on-top-checkbox {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  font-size: 12px;
+  user-select: none;
+  position: relative;
+  margin-left: 10px;
+  padding-left: 22px;
+  color: #f0f0f0;
+  font-family: sans-serif;
+}
+
+.always-on-top-checkbox input {
+  position: absolute;
+  opacity: 0;
+  cursor: pointer;
+  height: 0;
+  width: 0;
+}
+
+.always-on-top-checkbox .checkmark {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 12px;
+  width: 12px;
+  background-color: #222;
+  border: 2px solid #666;
+  border-radius: 4px;
+  transition: all 0.2s ease;
+}
+
+.always-on-top-checkbox input:checked ~ .checkmark {
+  background-color: #4caf50;
+  border-color: #4caf50;
+}
+
+.always-on-top-checkbox .checkmark::after {
+  content: "";
+  position: absolute;
+  display: none;
+  left: 4px;
+  top: -2px;
+  width: 3px;
+  height: 12px;
+  border: solid white;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.always-on-top-checkbox input:checked ~ .checkmark::after {
+  display: block;
+}
+
+.basic-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background-color: #222;
+  color: #fff;
+  border: 1px solid #444;
+  padding: 10px 18px;
+  border-radius: 8px;
+  font-size: 16px;
+  font-family: 'Inter', sans-serif;
+  cursor: pointer;
+  transition: background-color 0.2s ease, transform 0.1s ease;
+  flex: 0 0 auto;
+}
+
+.basic-button:hover {
+  border-color: #555;
+  transform: scale(1.02);
+}
+
+.basic-button:active {
+  transform: scale(0.97);
+}
+
+.material-icons {
+  font-size: 20px;
+  vertical-align: middle;
+}
+
+.search-container {
+  display: flex;
+  align-items: center;
+  background-color: #1f1f1f;
+  border: 1px solid #333;
+  border-radius: 8px;
+  padding: 8px 12px;
+  gap: 8px;
+  max-width: 300px;
+  font-family: 'Inter', sans-serif;
+}
+
+.search-container .material-icons {
+  color: #888;
+  font-size: 20px;
+}
+
+#search-box {
+  flex: 2;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: #fff;
+  font-size: 16px;
+  width: 100%;
+  font-family: inherit;
+}
+
+#search-box::placeholder {
+  color: #666;
+}
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
+  gap: 16px;
+  padding: 1rem;
+}
+
+.card {
+  background-color: #1c1c1c;
+  border: 1px solid #333;
+  border-radius: 10px;
+  overflow: hidden;
+  width: 100%;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  transition: transform 0.2s ease;
+}
+
+.card:hover {
+  transform: translateY(-4px);
+}
+
+.image-wrapper {
+  position: relative;
+  width: 100%;
+  height: 60px;
+  overflow: hidden;
+}
+
+.image-wrapper img {
+  width: 100%;
+  height: 100%;
+  image-rendering: pixelated;
+  object-fit: contain;
+}
+
+.quantity-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background-color: #ff5252;
+  color: #fff;
+  padding: 2px 6px;
+  font-size: 12px;
+  border-radius: 6px;
+  font-weight: bold;
+}
+
+.item-name {
+  padding: 10px;
+  font-size: 14px;
+  text-align: center;
+  color: #fff;
+  white-space: normal;       /* ✅ allow line break */
+  overflow-wrap: break-word; /* ✅ break long words */
+  word-break: break-word;
+  min-height: 3.5em;          /* ✅ optional: reserve space */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.loaded {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: #006e32;
+}
+
+.not-loaded {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: #970000;
+}
+
+footer {
+  position: sticky;
+}
+
+/* Backdrop (optional) */
+#panel-backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(2px);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  z-index: 999;
+  pointer-events: none;
+}
+
+#panel-backdrop.show {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* Side panel */
+.side-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 320px;
+  height: 100%;
+  background-color: #1c1c1c;
+  color: white;
+  padding: 1rem;
+  box-shadow: -4px 0 12px rgba(0, 0, 0, 0.4);
+  transform: translateX(100%);
+  transition: transform 0.3s ease;
+  z-index: 1000;
+  overflow-y: auto;
+}
+
+.side-panel.show {
+  transform: translateX(0%);
+}
+
+.panel-content img {
+  width: 200px;
+  height: 200px;
+  align-items: center;
+  image-rendering: pixelated;
+}
+
+/* Close button */
+.side-panel #close-panel {
+  background: none;
+  border: none;
+  color: white;
+  font-size: 1.5rem;
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  cursor: pointer;
+}
+
+.recycle-btn {
+  margin-top: 1rem;
+  padding: 10px 16px;
+  background-color: #00c853;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: bold;
+  transition: background-color 0.2s ease;
+}
+
+.recycle-btn:hover {
+  background-color: #00b248;
+}
+
+
+#recycling-list-section {
+  margin-top: 2rem;
+  padding: 1rem;
+  border-top: 1px solid #333;
+}
+
+#recycling-list-section h3 {
+  color: #ccc;
+  margin-bottom: 0.75rem;
+}
+
+.recycling-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.recycling-list li {
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+  color: #eee;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border: 1px solid #333;
+}
+
+.recycling-list img {
+  width: 32px;
+  height: 32px;
+  margin-right: 0.75rem;
+  vertical-align: middle;
+  image-rendering: pixelated;
+  object-fit: contain;
+}
+
+.recycling-item-info {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex: 1;
+}
+
+
+.recycling-item-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.remove-btn {
+  background: transparent;
+  border: none;
+  color: red;
+  font-size: 1.2rem;
+  cursor: pointer;
+}
+
+.remove-btn:hover {
+  color: darkred;
+}

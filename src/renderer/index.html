@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>G-FurniMatic</title>
+  <link rel="stylesheet" href="style.css" />
+  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet" />
+</head>
+<body>
+  <header>
+    <div class="titlebar">
+      <div class="drag">G-FurniMatic</div>
+      <div class="window-buttons">
+        <button id="min">—</button>
+        <button id="max">🗖</button>
+        <button id="close">×</button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- Recycling Queue -->
+    <section id="recycling-list-section">
+      <h3>Recycling Queue</h3>
+      <ul id="recycling-list" class="recycling-list"></ul>
+    </section>
+    
+    <!-- Search and refresh bar -->
+    <div class="search-bar">
+      <div class="search-container">
+        <span class="material-icons">search</span>
+        <input type="text" id="search-box" placeholder="Search..." />
+      </div>
+
+      <button id="refresh-btn" class="basic-button">
+        <span class="material-icons">refresh</span>
+      </button>
+
+      <div>
+        <span id="furnidata-status"></span>
+      </div>
+    </div>
+
+    <!-- Card Grid -->
+    <div id="card-container" class="card-grid"></div>
+
+    <!-- Side Panel -->
+    <div id="panel-backdrop"></div>
+    <div id="side-panel" class="side-panel">
+      <button id="close-panel">×</button>
+      <div id="panel-content"></div>
+    </div>
+  </main>
+
+  <footer>
+    <label class="always-on-top-checkbox">
+      <input type="checkbox" id="always-on-top-checkbox">
+      <span class="checkmark"></span>
+      Always on top
+    </label>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>
