@@ -78,6 +78,14 @@ class Ui {
   public sendRecycleList(queue: FurniCard[]) {
     this.win?.webContents.send('recycle-list:update', queue);
   }
+
+  public toggleRecycler(running: boolean){
+    if(running){
+      this.win?.webContents.send('on-recycle-on');
+    } else {
+      this.win?.webContents.send('on-recycle-off');
+    }
+  }
 }
 
 class GFurniMatic {
@@ -88,7 +96,8 @@ class GFurniMatic {
   private furniDataReady!: Promise<void>;
   private resolveFurniDataReady!: () => void;
   private recycleQueue: FurniCard[] = [];
-
+  private interval?: NodeJS.Timeout | null;
+  private queue: Map<number, RecycleFurni> = new Map();
   constructor() {
     const extensionInfo = JSON.parse(
       readFileSync(new URL('./extension.json', import.meta.url)).toString()
@@ -109,6 +118,7 @@ class GFurniMatic {
     this.setupRecycleQueueHandlers();
 
     ipcMain.on('refresh', () => this.refreshInventory());
+    ipcMain.on('recycle', () => this.recycle())
   }
 
   private async loadFurniData(host: string) {
@@ -184,10 +194,12 @@ class GFurniMatic {
       ([typeId, furni]) => ({
         imgUrl: `https://images.habbo.com/dcr/hof_furni/${furni.data?.revision}/${furni.data?.classname}_icon.png`,
         quantity: furni.items.length,
+        recycleQuantity: furni.items.length, // default to max available
         name: furni.data?.name || `Unknown (${typeId})`,
-        typeId,
+        typeId
       })
     );
+
 
     this.ui.sendCards(cards);
   }
@@ -204,23 +216,116 @@ class GFurniMatic {
     );
   }
 
-  private setupRecycleQueueHandlers() {
-    ipcMain.handle('recycle:add', (_event, card: FurniCard) => {
-      if (this.recycleQueue.find((q) => q.name === card.name)) return;
-      this.recycleQueue.push(card);
-      this.ui.sendRecycleList(this.recycleQueue);
-    });
-
-    ipcMain.handle('recycle:remove', (_event, cardName: string) => {
-      this.recycleQueue = this.recycleQueue.filter((c) => c.name !== cardName);
-      this.ui.sendRecycleList(this.recycleQueue);
-    });
-
-    ipcMain.handle('recycle:clear', () => {
-      this.recycleQueue = [];
-      this.ui.sendRecycleList(this.recycleQueue);
-    });
+  private recycleItemsInQueue(){
+    const itemsToRecycle = [];
+    console.log(this.queue)
+    for(const furni of this.queue.values()){
+      if(itemsToRecycle.length  === 8 ) break;
+      for(const item in furni.items){
+        if(itemsToRecycle.length  === 8 ) break;
+        itemsToRecycle.push(furni.items[item])
+      }
+    }
+    const packet = new HPacket('RecycleItems', HDirection.TOSERVER);
+    packet.appendInt(8);
+    for(const item in itemsToRecycle){
+      console.log(`Adding item to recycle ${itemsToRecycle[item].itemId}`)
+      packet.appendInt(-(itemsToRecycle[item].id))
+    }
+    this.ext.sendToServer(packet)
+    this.internalRemoveInventory(itemsToRecycle)
   }
+
+  private internalRemoveInventory(items: HInventoryItem[]){
+    items.forEach(el => {
+      const furniture = this.furniture.get(el.typeId)
+      this.furniture.set(el.typeId, {...furniture, items: furniture?.items.filter(i => i.id != el.id)} as RecycleFurni)
+      this.queue.set(el.typeId, {...furniture, items: furniture?.items.filter(i => i.id != el.id)} as RecycleFurni)
+    })
+    this.updateUiCards()
+  }
+
+  private updateUiCards(){
+      const cards: FurniCard[] = Array.from(this.furniture.entries()).map(
+      ([typeId, furni]) => ({
+        imgUrl: `https://images.habbo.com/dcr/hof_furni/${furni.data?.revision}/${furni.data?.classname}_icon.png`,
+        quantity: furni.items.length,
+        name: furni.data?.name || `Unknown (${typeId})`,
+        typeId: typeId,
+      })
+    );
+
+    cards.forEach(el => {
+      this.updateRecycleQuantity(el.typeId, el.quantity)
+    })
+    this.ui.sendCards(cards);
+  }
+
+  private recycle(){
+    if(!this.interval){
+      this.ui.toggleRecycler(true)
+      this.interval = setInterval(this.recycleItemsInQueue.bind(this), 15000)
+    } else {
+      clearInterval(this.interval)
+      this.ui.toggleRecycler(false)
+      console.log('STOPPED RECYCLING')
+      this.interval = null;
+    }
+  }
+  private updateRecycleQuantity(typeId: number, newQuantity: number) {
+  // find queued card
+  const card = this.recycleQueue.find(c => c.typeId === typeId);
+  if (!card) return;
+
+  // clamp to available
+  const max = this.queue.get(typeId)?.items.length ?? card.quantity ?? 1;
+  const clamped = Math.max(1, Math.min(newQuantity | 0, max));
+
+  // store chosen amount separately (don’t destroy original quantity)
+  (card as any).recycleQuantity = clamped;
+
+  // if you also mirror in queue map (optional):
+  const furni = this.queue.get(typeId);
+  if (furni) {
+    furni.items = furni.items.slice(0, clamped);
+    this.queue.set(typeId, furni);
+  }
+
+  this.updateRecycleList();
+}
+private updateRecycleList() {
+  this.ui.win?.webContents.send('recycle-list:update', this.recycleQueue);
+}
+
+private setupRecycleQueueHandlers() {
+  ipcMain.handle('recycle:add', (_event, card: FurniCard) => {
+    if (this.recycleQueue.find(q => q.typeId === card.typeId)) return;
+
+    const pool = this.furniture.get(card.typeId);
+    const max = pool?.items.length ?? card.quantity ?? 1;
+
+    // default: recycle all available unless changed later
+    this.recycleQueue.push({ ...card, recycleQuantity: max });
+    this.queue.set(card.typeId, pool as RecycleFurni);
+    this.updateRecycleList();
+  });
+
+  ipcMain.handle('recycle:update', (_event, typeId: number, newQty: number) => {
+    this.updateRecycleQuantity(typeId, newQty);
+  });
+
+  ipcMain.handle('recycle:remove', (_event, typeId: number, cardName: string) => {
+    this.recycleQueue = this.recycleQueue.filter(c => c.typeId !== typeId && c.name !== cardName);
+    this.queue.delete(typeId);
+    this.updateRecycleList();
+  });
+
+  ipcMain.handle('recycle:clear', () => {
+    this.recycleQueue = [];
+    this.queue.clear();
+    this.updateRecycleList();
+  });
+}
 }
 
 new GFurniMatic();

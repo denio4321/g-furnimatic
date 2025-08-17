@@ -17,7 +17,7 @@ function renderCards(cardDataArray) {
   const fragment = document.createDocumentFragment();
   const cardTemplate = document.createElement('template');
 
-  for (const { imgUrl, quantity, name } of cardDataArray) {
+  for (const {typeId, imgUrl, quantity, name } of cardDataArray) {
     cardTemplate.innerHTML = `
       <div class="card">
         <div class="image-wrapper">
@@ -30,7 +30,7 @@ function renderCards(cardDataArray) {
 
     const node = cardTemplate.content.cloneNode(true);
     node.querySelector('.card').addEventListener('click', () =>
-      showSidePanel({ imgUrl, quantity, name })
+      showSidePanel({ typeId, imgUrl, quantity, name })
     );
     fragment.appendChild(node);
   }
@@ -85,6 +85,25 @@ document.getElementById('refresh-btn').addEventListener('click', () => {
   window.api.refresh();
 });
 
+// Recycle
+document.getElementById('recycle-btn').addEventListener('click', () => {
+  window.api.recycle();
+});
+
+
+function recycleOn() {
+  
+  document.getElementById('recycling-status').classList.remove('recycle-stop');
+  document.getElementById('recycling-status').classList.add('recycle-run');
+  document.getElementById('recycling-status').textContent = "Recycling ongoing"
+}
+
+function recycleOff() {
+  document.getElementById('recycling-status').classList.remove('recycle-run');
+  document.getElementById('recycling-status').classList.add('recycle-stop');
+  document.getElementById('recycling-status').textContent = "Recycled stopped"
+}
+
 // Debounced search
 function debounce(fn, delay) {
   let timeout;
@@ -111,6 +130,8 @@ function renderRecycleList(queue) {
   list.innerHTML = '';
 
   for (const card of queue) {
+    const selected = card.recycleQuantity ?? card.quantity;
+
     const li = document.createElement('li');
     li.dataset.name = card.name;
 
@@ -120,13 +141,13 @@ function renderRecycleList(queue) {
         <span>${card.name}</span>
       </div>
       <div class="recycling-item-actions">
-        <span>x${card.quantity}</span>
+        <span>x${selected} / ${card.quantity}</span>
         <button class="remove-btn" title="Remove from queue">🗑️</button>
       </div>
     `;
 
     li.querySelector('.remove-btn').addEventListener('click', () => {
-      window.api.removeFromRecycleQueue(card.name);
+      window.api.removeFromRecycleQueue(card.typeId, card.name);
     });
 
     list.appendChild(li);
@@ -134,3 +155,6 @@ function renderRecycleList(queue) {
 }
 
 window.api.onRecycleListUpdate(renderRecycleList);
+
+window.api.onRecycleOn(recycleOn)
+window.api.onRecycleOff(recycleOff)

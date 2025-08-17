@@ -12,6 +12,9 @@ contextBridge.exposeInMainWorld('api', {
   // Inventory refresh
   refresh: () => ipcRenderer.send('refresh'),
 
+  // Recycle
+  recycle: () => ipcRenderer.send('recycle'),
+
   // Cards & furnidata
   onLoadCards: (callback) =>
     ipcRenderer.on('load-cards', (_event, data) => callback(data)),
@@ -19,10 +22,15 @@ contextBridge.exposeInMainWorld('api', {
   furniDataLoaded: (callback) =>
     ipcRenderer.on('furni-data-loaded', (_event, status) => callback(status)),
 
+  onRecycleOn: (callback) => ipcRenderer.on('on-recycle-on', callback),
+  onRecycleOff: (callback) => ipcRenderer.on('on-recycle-off', callback),
+
   // Recycling queue
   addToRecycleQueue: (card) => ipcRenderer.invoke('recycle:add', card),
-  removeFromRecycleQueue: (name) => ipcRenderer.invoke('recycle:remove', name),
+  removeFromRecycleQueue: (typeId, name) => ipcRenderer.invoke('recycle:remove', typeId, name),
   clearRecycleQueue: () => ipcRenderer.invoke('recycle:clear'),
   onRecycleListUpdate: (callback) =>
     ipcRenderer.on('recycle-list:update', (_event, list) => callback(list)),
+updateRecycleQuantity: (typeId, qty) => ipcRenderer.invoke('recycle:update', typeId, qty),
+
 });

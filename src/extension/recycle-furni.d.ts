@@ -11,4 +11,5 @@ export interface FurniCard {
     name: string;
     typeId: number;
     selectedQuantity?: number;
+    recycleQuantity?:number;
 }
