@@ -30,7 +30,11 @@ import {
 
 const BATCH_SIZE = 8;              // the Furni-Matic only takes full batches
 const MIN_BATCH_GAP = 3000;        // never feed it faster than this, even when the hotel reports no pause
-const STATUS_TIMEOUT = 4000;       // without an answer to the status request, try the batch anyway
+const STATUS_TIMEOUT = 4000;       // then the batch waits out the hotel's pause instead of asking again
+const LATE_STATUS_WINDOW = 15000;  // answers to our status request that come late are still ours
+const PAUSE_MARGIN = 1500;         // on top of the pause the hotel asked for, when it stops answering
+const DEFAULT_PAUSE = 10000;       // what habbo.es asks between batches, until the hotel tells otherwise
+const REFUSED_RETRIES = 2;
 const FINISH_TIMEOUT = 15000;
 const INVENTORY_TIMEOUT = 4000;
 const PRICE_TIMEOUT = 4000;
@@ -228,7 +232,12 @@ class GFurniMatic {
   // The hotel's answers to our own requests are kept from the game, or it plays sounds and shows
   // popups for things the person never did in the client
   private awaitingStatus = false;
+  private statusAskedAt = 0;
+  private statusUnanswered = false;
   private ownActionAt = 0;
+  // The full pause the hotel asks for after a batch, learned from its answers
+  private hotelPause = DEFAULT_PAUSE;
+  private refusedRetries = 0;
 
   private duckets: number | null = null;
   private batchCost: number | null = null;
@@ -875,6 +884,7 @@ class GFurniMatic {
     this.recycler.notice = null;
     this.runOnce = once;
     this.runBatches = 0;
+    this.refusedRetries = 0;
     this.runStartedAt = Date.now();
     this.checkRecycler();
   }
@@ -883,6 +893,7 @@ class GFurniMatic {
   private stop(notice: Notice | null = null) {
     clearTimeout(this.loopTimer);
     if (notice) log('recycling stopped:', notice.code, JSON.stringify(notice.values));
+    this.statusUnanswered = false;
     this.recycler.running = false;
     this.recycler.notice = notice;
     // A batch already sent still gets its answer, so the inventory stays right
@@ -905,11 +916,23 @@ class GFurniMatic {
   private checkRecycler() {
     this.setPhase('checking');
     this.awaitingStatus = true;
+    this.statusUnanswered = true;
+    this.statusAskedAt = Date.now();
     this.ext.sendToServer(new HPacket('GetRecyclerStatus', HDirection.TOSERVER));
     this.loopTimer = setTimeout(() => {
       this.awaitingStatus = false;
-      this.feedBatch();
+      // The hotel stops answering now and then: never send blind, wait out the pause it asked for last
+      const left = this.lastBatchAt + this.hotelPause + PAUSE_MARGIN - Date.now();
+      log('no RecyclerStatus answer, waiting', Math.max(0, left), 'ms before the next batch');
+      if (left > 0) this.wait(left, () => this.feedBatch());
+      else this.feedBatch();
     }, STATUS_TIMEOUT);
+  }
+
+  private learnPause(seconds: number) {
+    // Remaining seconds plus what already passed since the batch: the whole pause
+    const pause = Date.now() - this.lastBatchAt + seconds * 1000;
+    if (this.lastBatchAt && pause > this.hotelPause && pause < 120000) this.hotelPause = pause;
   }
 
   private wait(ms: number, then: () => void) {
@@ -918,15 +941,20 @@ class GFurniMatic {
   }
 
   private onRecyclerStatus(hMessage: HMessage) {
-    if (!this.awaitingStatus) return; // the game's own recycler window asked
-    this.awaitingStatus = false;
+    // A late answer to our still unanswered request is ours too; anything else is the game's own window
+    const late = this.statusUnanswered && Date.now() - this.statusAskedAt < LATE_STATUS_WINDOW;
+    if (!this.awaitingStatus && !late) return;
+    this.statusUnanswered = false;
     hMessage.blocked = true;
 
+    const [status, seconds] = hMessage.getPacket().read('ii');
+    log('RecyclerStatus', status, 'seconds', seconds, this.awaitingStatus ? '' : '(late)');
+    if (status === RECYCLER_COOLDOWN) this.learnPause(seconds);
+
+    if (!this.awaitingStatus) return;
+    this.awaitingStatus = false;
     if (!this.recycler.running || this.recycler.phase !== 'checking') return;
     clearTimeout(this.loopTimer);
-
-    const [status, seconds] = hMessage.getPacket().read('ii');
-    log('RecyclerStatus', status, 'seconds', seconds);
     const gap = this.lastBatchAt + MIN_BATCH_GAP - Date.now();
 
     if (status === RECYCLER_OPEN) {
@@ -970,6 +998,7 @@ class GFurniMatic {
     this.ext.sendToServer(packet);
 
     this.pendingBatch = batch;
+    this.statusUnanswered = false; // a status answer that shows up now is of no use to us
     this.lastSentAt = this.ownActionAt = Date.now();
     this.setPhase('recycling');
 
@@ -993,10 +1022,21 @@ class GFurniMatic {
     const finished = hMessage.getPacket();
     log('RecyclerFinished status', status, 'second int', finished.getBytesLength() >= 14 ? finished.readInteger(10) : 'none');
     if (status !== RECYCLE_OK) {
+      // After good batches a refusal is the hotel's pause still running: nothing was recycled, so the
+      // same batch goes again once the pause is surely over
+      if (this.recycler.running && this.runBatches > 0 && this.refusedRetries < REFUSED_RETRIES) {
+        this.refusedRetries++;
+        const pause = this.hotelPause + PAUSE_MARGIN;
+        log('batch refused, retrying in', pause, 'ms', `(${this.refusedRetries}/${REFUSED_RETRIES})`);
+        this.lastBatchAt = Date.now();
+        this.wait(pause, () => this.checkRecycler());
+        return;
+      }
       this.stop(this.notice('error', 'refused'));
       return;
     }
 
+    this.refusedRetries = 0;
     this.removeFromInventory(batch);
     this.recycler.batchesSent++;
     this.runBatches++;
