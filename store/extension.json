@@ -1,6 +1,6 @@
 {
   "title": "G-FurniMatic",
-  "description": "Recycle furni from your inventory in bulk.\n\nPick the furni you want to get rid of, add them to the recycling queue and G-FurniMatic feeds the Furnimatic for you, 8 items at a time.",
+  "description": "Feeds the Furni-Matic for you: pick the furni you want to get rid of and it recycles them 8 at a time.\n\n- Waits for the hotel's answer and its pause between batches, batch after batch or one at a time\n- Keep a few of each, lock furni that must never go; LTDs and rentals stay out\n- Safe price: furni worth more on the Marketplace are hidden and need your OK\n- Places, opens and picks up prize boxes in your own room, and logs every prize with its rarity\n- No game sounds or popups for things you didn't do\n\nEnglish, Español, Português.",
   "authors": [
     {
       "name": ".Denio"
