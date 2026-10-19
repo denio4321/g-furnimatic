@@ -2,71 +2,199 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; img-src 'self' https://images.habbo.com data:; style-src 'self'; font-src 'self'; script-src 'self'" />
   <title>G-FurniMatic</title>
+  <link rel="stylesheet" href="fonts/fonts.css" />
   <link rel="stylesheet" href="style.css" />
-  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet" />
 </head>
 <body>
-  <header>
-    <div class="titlebar">
-      <div class="drag">G-FurniMatic</div>
-      <div class="window-buttons">
-        <button id="min">—</button>
-        <button id="max">🗖</button>
-        <button id="close">×</button>
-      </div>
+  <svg class="sprite" aria-hidden="true">
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.4-4.4"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3"/><path d="M19.5 4.5V9H15"/></symbol>
+    <symbol id="i-minimize" viewBox="0 0 24 24"><path d="M6.5 12h11"/></symbol>
+    <symbol id="i-maximize" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="1"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5.5" y="10.5" width="13" height="9.5" rx="1.5"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/></symbol>
+    <symbol id="i-minus" viewBox="0 0 24 24"><path d="M7 12h10"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 7v10M7 12h10"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 8h9M17 8h3M4 16h3M11 16h9"/><circle cx="15" cy="8" r="2"/><circle cx="9" cy="16" r="2"/></symbol>
+    <symbol id="i-box" viewBox="0 0 24 24"><rect x="4.5" y="10.5" width="15" height="9.5" rx="1"/><path d="M3.5 7.5h17v3h-17zM12 7.5V20"/><path d="M12 7.5C10.6 4.6 7.5 4.3 7.5 6c0 1.5 4.5 1.5 4.5 1.5s4.5 0 4.5-1.5c0-1.7-3.1-1.4-4.5 1.5z"/></symbol>
+    <symbol id="i-tile" viewBox="0 0 24 24"><path d="M12 5 21 10 12 15 3 10z"/><path d="M3 10v3l9 5 9-5v-3"/></symbol>
+  </svg>
+
+  <header class="titlebar">
+    <span class="wordmark">G-FurniMatic</span>
+    <div class="window-buttons">
+      <button id="min" class="window-button" type="button" data-i18n-title="win.minimize" data-i18n-label="win.minimize">
+        <svg class="icon"><use href="#i-minimize"/></svg>
+      </button>
+      <button id="max" class="window-button" type="button" data-i18n-title="win.maximize" data-i18n-label="win.maximize">
+        <svg class="icon"><use href="#i-maximize"/></svg>
+      </button>
+      <button id="close" class="window-button close" type="button" data-i18n-title="win.closeHint" data-i18n-label="win.close">
+        <svg class="icon"><use href="#i-close"/></svg>
+      </button>
     </div>
   </header>
 
-  <main>
-    <!-- Recycling Queue -->
-    <section id="recycling-list-section">
-      <h3>Recycling Queue</h3>
-      <ul id="recycling-list" class="recycling-list"></ul>
+  <main class="layout">
+    <section class="inventory">
+      <div class="inventory-bar">
+        <div class="tabs" role="tablist">
+          <button id="tab-inventory" class="tab" type="button" role="tab" aria-selected="true" aria-controls="inventory-view"
+                  data-i18n="inv.title">Inventory</button>
+          <button id="tab-log" class="tab" type="button" role="tab" aria-selected="false" aria-controls="log-view"></button>
+        </div>
+        <div id="inventory-tools" class="inventory-tools">
+          <label class="search">
+            <svg class="icon"><use href="#i-search"/></svg>
+            <input id="search" type="search" autocomplete="off" data-i18n-placeholder="inv.search" data-i18n-label="inv.search" />
+          </label>
+          <button id="add-results" class="button accent" type="button" data-i18n-title="inv.addResultsHint" hidden></button>
+          <button id="reload" class="button" type="button">
+            <svg class="icon"><use href="#i-refresh"/></svg>
+            <span data-i18n="inv.reload">Reload</span>
+          </button>
+        </div>
+      </div>
+
+      <div id="inventory-view" class="view" role="tabpanel" aria-labelledby="tab-inventory">
+        <div class="inventory-meta">
+          <p id="inventory-summary" class="inventory-summary"></p>
+          <p id="hidden-note" class="hidden-note" hidden>
+            <span id="hidden-text"></span>
+            <button id="hidden-toggle" class="text-button" type="button"></button>
+          </p>
+        </div>
+        <div id="inventory-grid" class="grid" role="list" data-i18n-label="inv.gridLabel"></div>
+        <div id="inventory-empty" class="empty" hidden>
+          <p id="inventory-empty-title" class="empty-title"></p>
+          <p id="inventory-empty-text" class="empty-text"></p>
+        </div>
+      </div>
+
+      <div id="log-view" class="view" role="tabpanel" aria-labelledby="tab-log" hidden>
+        <div id="log-stats" class="log-stats"></div>
+        <ol id="log" class="log"></ol>
+        <div id="log-empty" class="empty" hidden>
+          <p class="empty-text" data-i18n="log.empty"></p>
+        </div>
+      </div>
     </section>
-    
-    <!-- Search and refresh bar -->
-    <div class="search-bar">
-      <div class="search-container">
-        <span class="material-icons">search</span>
-        <input type="text" id="search-box" placeholder="Search..." />
+
+    <aside class="machine" aria-labelledby="machine-title">
+      <div class="machine-head">
+        <h2 id="machine-title">Furni-Matic</h2>
+        <button id="settings-toggle" class="icon-button" type="button" aria-expanded="false" aria-controls="settings"
+                data-i18n-title="settings.label" data-i18n-label="settings.label">
+          <svg class="icon"><use href="#i-sliders"/></svg>
+        </button>
       </div>
 
-      <button id="refresh-btn" class="basic-button">
-        <span class="material-icons">refresh</span>
-      </button>
-      <button id="recycle-btn" class="basic-button">
-        <span class="material-icons">recycling</span>
-      </button>
-      <span id="recycling-status" class="recycle-stop">
-        Recycled stopped
-      </span>
+      <form id="settings" class="settings" hidden>
+        <label class="field">
+          <span class="field-label" data-i18n="settings.priceCap">Price limit</span>
+          <span class="field-control"><input id="price-cap" type="number" min="0" step="1" /> <span data-i18n="settings.credits">credits</span></span>
+          <span class="field-help" data-i18n="settings.priceHelp"></span>
+        </label>
+        <label class="check">
+          <input id="hide-expensive" type="checkbox" />
+          <span data-i18n="settings.hideExpensive">Hide furni above the safe price</span>
+        </label>
+        <label class="field">
+          <span class="field-label" data-i18n="settings.keep">Keep by default</span>
+          <span class="field-control"><input id="default-keep" type="number" min="0" step="1" /> <span data-i18n="settings.ofEach">of each</span></span>
+          <span class="field-help" data-i18n="settings.keepHelp"></span>
+        </label>
+        <label class="field">
+          <span class="field-label" data-i18n="settings.language">Language</span>
+          <select id="language" class="field-select">
+            <option value="auto" data-i18n="settings.languageAuto">Same as the hotel</option>
+            <option value="en">English</option>
+            <option value="es">Español</option>
+            <option value="pt">Português</option>
+          </select>
+        </label>
+      </form>
 
-
-      <div>
-        <span id="furnidata-status"></span>
+      <div class="hopper">
+        <div id="hopper" class="hopper-bed" data-i18n-label="hopper.label"></div>
+        <div id="hopper-meter" class="hopper-meter"><span></span></div>
       </div>
-    </div>
 
-    <!-- Card Grid -->
-    <div id="card-container" class="card-grid"></div>
+      <div class="readout">
+        <span id="batches-count" class="count">0</span>
+        <span id="batches-label" class="readout-label"></span>
+      </div>
+      <p id="recycler-status" class="status-line" role="status" aria-live="polite"></p>
+      <div class="run-row">
+        <button id="run" class="run-button" type="button"></button>
+        <button id="run-once" class="button run-once" type="button" data-i18n="run.once" data-i18n-title="run.onceHint"></button>
+      </div>
 
-    <!-- Side Panel -->
-    <div id="panel-backdrop"></div>
-    <div id="side-panel" class="side-panel">
-      <button id="close-panel">×</button>
-      <div id="panel-content"></div>
-    </div>
+      <div class="section-head">
+        <h3 data-i18n="queue.title">Queue</h3>
+        <button id="clear-queue" class="text-button" type="button" data-i18n="queue.clear">Clear</button>
+      </div>
+      <ul id="queue" class="queue"></ul>
+      <p id="queue-empty" class="queue-empty" data-i18n="queue.empty"></p>
+
+      <div id="last-prize" class="last-prize" hidden>
+        <span id="last-prize-well" class="well"></span>
+        <span class="last-prize-text">
+          <span class="last-prize-label" data-i18n="prizes.last">Last prize</span>
+          <span id="last-prize-name" class="last-prize-name"></span>
+        </span>
+        <button id="prizes-log" class="text-button" type="button"></button>
+      </div>
+
+      <section class="boxes" aria-labelledby="boxes-title">
+        <div class="section-head">
+          <h3 id="boxes-title" data-i18n="boxes.title">Prize boxes</h3>
+        </div>
+        <p id="boxes-text" class="boxes-text" role="status" aria-live="polite"></p>
+        <div id="boxes-spot" class="boxes-spot" hidden>
+          <svg class="icon"><use href="#i-tile"/></svg>
+          <span id="boxes-spot-text" class="boxes-spot-text"></span>
+          <button id="boxes-spot-button" class="button small" type="button"></button>
+        </div>
+        <button id="boxes-button" class="button primary boxes-button" type="button" hidden>
+          <svg class="icon"><use href="#i-box"/></svg>
+          <span id="boxes-button-text"></span>
+        </button>
+        <label class="check">
+          <input id="auto-open" type="checkbox" />
+          <span data-i18n="boxes.autoOpen">Open boxes after each batch</span>
+        </label>
+        <span class="field-help check-help" data-i18n="boxes.autoOpenHelp"></span>
+      </section>
+    </aside>
   </main>
 
-  <footer>
-    <label class="always-on-top-checkbox">
-      <input type="checkbox" id="always-on-top-checkbox">
-      <span class="checkmark"></span>
-      Always on top
+  <footer class="statusbar">
+    <span id="status-hotel" class="status"><span class="dot"></span><span class="status-text"></span></span>
+    <span id="status-furnidata" class="status"><span class="dot"></span><span class="status-text"></span></span>
+    <span id="status-duckets" class="status duckets"><span class="status-text"></span></span>
+    <label class="on-top">
+      <input id="always-on-top" type="checkbox" />
+      <span data-i18n="onTop">Always on top</span>
     </label>
   </footer>
 
+  <!-- Safeguard: furni over the price limit don't get recycled until this is answered -->
+  <dialog id="guard" class="guard" aria-labelledby="guard-title">
+    <h2 id="guard-title" class="guard-title"></h2>
+    <p id="guard-text" class="guard-text"></p>
+    <ul id="guard-list" class="guard-list"></ul>
+    <p class="guard-note" data-i18n="guard.changeLimit"></p>
+    <div class="guard-actions">
+      <button id="guard-allow" class="button danger" type="button" data-i18n="guard.allow"></button>
+      <button id="guard-remove" class="button" type="button" data-i18n="guard.remove" autofocus></button>
+    </div>
+  </dialog>
+
+  <script src="i18n.js"></script>
   <script src="script.js"></script>
 </body>
 </html>

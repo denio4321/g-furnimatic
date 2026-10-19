@@ -1,0 +1,23 @@
+{
+  "title": "G-FurniMatic",
+  "description": "Recycle furni from your inventory in bulk.\n\nPick the furni you want to get rid of, add them to the recycling queue and G-FurniMatic feeds the Furnimatic for you, 8 items at a time.",
+  "authors": [
+    {
+      "name": ".Denio"
+    }
+  ],
+  "categories": ["Usability", "Trading"],
+  "source": "https://github.com/denio4321/g-furnimatic",
+  "readme": "https://github.com/denio4321/g-furnimatic#readme",
+  "releases": "https://github.com/denio4321/g-furnimatic/releases",
+  "stable": true,
+  "language": "Node.js",
+  "commands": {
+    "default": ["cmd", "/C", "G-FurniMatic.exe", "-c", "{cookie}", "-p", "{port}", "-f", "{filename}"]
+  },
+  "compatibility": {
+    "systems": ["Windows"],
+    "clients": ["Flash"]
+  },
+  "isOutdated": false
+}

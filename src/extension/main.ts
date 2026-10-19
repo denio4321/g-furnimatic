@@ -1,5 +1,5 @@
-import { BrowserWindow, ipcMain } from 'electron';
-import { readFileSync } from 'fs';
+import { app, BrowserWindow, ipcMain } from 'electron';
+import { mkdirSync, readFileSync, writeFileSync } from 'fs';
 import {
   Extension,
   FurniData,
@@ -8,30 +8,120 @@ import {
   HInventoryItem,
   HMessage,
   HPacket,
+  HProductType,
   Hotel
 } from 'gnode-api';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { FurniCard, RecycleFurni } from './recycle-furni';
+import {
+  AppState,
+  BoxState,
+  FurniCard,
+  LootEntry,
+  Notice,
+  PriceInfo,
+  PrizeLevel,
+  QueueEntry,
+  RecycleFurni,
+  RecyclerPhase,
+  RecyclerState,
+  Settings
+} from './recycle-furni';
+
+const BATCH_SIZE = 8;              // the Furni-Matic only takes full batches
+const MIN_BATCH_GAP = 3000;        // never feed it faster than this, even when the hotel reports no pause
+const STATUS_TIMEOUT = 4000;       // without an answer to the status request, try the batch anyway
+const FINISH_TIMEOUT = 15000;
+const INVENTORY_TIMEOUT = 4000;
+const PRICE_TIMEOUT = 4000;
+const PRICE_GAP = 300;
+const BOX_OPEN_DELAY = 1000;       // gives the hotel time to put the prize box in the inventory
+const PRIZE_BOX_WAIT = 3000;       // how long the new box gets to show up before trusting the prize id
+const BOX_STEP_TIMEOUT = 5000;
+const BOX_STEP_GAP = 400;          // between placing and opening, and between opening and picking up
+const BOX_GAP = 1200;
+const COST_WINDOW = 10000;
+const ECHO_WINDOW = 4000;          // hotel reactions to our own actions that the game shouldn't see
+const LOOT_LIMIT = 500;            // prizes kept in the log, across sessions
+const PRICE_TTL = 12 * 60 * 60 * 1000;  // Marketplace prices are reused for this long before asking again
+// The Furni-Matic's prize box ("Caja Misteriosa", type 4392 on habbo.es) and the old Ecotron one.
+// Gifts from other people (present_*) are never opened
+const PRIZE_BOXES = new Set(['matic_box', 'ecotron_box']);
+const isPrizeBox = (data?: { classname: string }) => !!data && PRIZE_BOXES.has(data.classname);
+
+// Codes as the Habbo client reads them from RecyclerStatus, RecyclerFinished and the activity points
+const RECYCLER_OPEN = 1;
+const RECYCLER_COOLDOWN = 3;
+const RECYCLE_OK = 1;
+const DUCKETS = 0;
+
+const HOTELS: Record<string, { hotel: Hotel; name: string }> = {
+  'game-nl.habbo.com': { hotel: Hotel.NL, name: 'habbo.nl' },
+  'game-br.habbo.com': { hotel: Hotel.COMBR, name: 'habbo.com.br' },
+  'game-tr.habbo.com': { hotel: Hotel.COMTR, name: 'habbo.com.tr' },
+  'game-de.habbo.com': { hotel: Hotel.DE, name: 'habbo.de' },
+  'game-fr.habbo.com': { hotel: Hotel.FR, name: 'habbo.fr' },
+  'game-fi.habbo.com': { hotel: Hotel.FI, name: 'habbo.fi' },
+  'game-es.habbo.com': { hotel: Hotel.ES, name: 'habbo.es' },
+  'game-it.habbo.com': { hotel: Hotel.IT, name: 'habbo.it' },
+  'game-us.habbo.com': { hotel: Hotel.COM, name: 'habbo.com' },
+  'game-s2.habbo.com': { hotel: Hotel.SANDBOX, name: 'sandbox.habbo.com' },
+};
+
+const DEFAULT_SETTINGS: Settings = {
+  priceCap: 3,
+  defaultKeep: 0,
+  hideExpensive: true,
+  autoOpen: true,
+  alwaysOnTop: false,
+  language: 'auto',
+  locked: [],
+  spots: {},
+};
+
+const LANGUAGES: Settings['language'][] = ['auto', 'en', 'es', 'pt'];
+
+type InventoryRequest = 'RequestFurniInventory' | 'RequestFurniInventoryWhenNotInRoom';
+
+interface PrizeBox {
+  placeId: number;
+}
+
+// A box goes through the room: placed on the chosen tile, opened, and its prize picked back up
+interface BoxJob {
+  id: number;
+  entry: LootEntry;
+  step: 'placing' | 'opening' | 'pickingUp';
+  prizeId?: number;
+  timer: NodeJS.Timeout;
+}
+
+// Colour variants are named "chair*3" in furnidata but "chair_3" on the image server
+const iconUrl = (data: RecycleFurni['data']) =>
+  data ? `https://images.habbo.com/dcr/hof_furni/${data.revision}/${data.classname.replace('*', '_')}_icon.png` : '';
+
+// LTDs and rentals stay out even when the hotel flags them as recyclable
+const canRecycle = (item: HInventoryItem) =>
+  item.isRecyclable &&
+  item.secondsToExpiration <= 0 &&
+  !item.hasRentPeriodStarted &&
+  (item.stuffCategory & 0xff00 & 0x100) === 0;
 
 class Ui {
-  private readonly extension: Extension;
   public win?: BrowserWindow;
 
-  constructor(extension: Extension) {
-    this.extension = extension;
-
-    ipcMain.on('minimize', () => this.win?.minimize());
-    ipcMain.on('maximize', () =>
+  constructor() {
+    ipcMain.on('window:minimize', () => this.win?.minimize());
+    ipcMain.on('window:maximize', () =>
       this.win?.isMaximized() ? this.win.unmaximize() : this.win?.maximize()
     );
-    ipcMain.on('close', () => this.win?.close());
-    ipcMain.on('alwaysOnTop', (_event, state: boolean) => {
-      this.win?.setAlwaysOnTop(state);
-    });
+    ipcMain.on('window:close', () => this.win?.close());
+
+    // Closing the window only hides the UI: the extension keeps running and G-Earth's button reopens it
+    app.on('window-all-closed', () => {});
   }
 
-  public startUi() {
+  public startUi(alwaysOnTop: boolean) {
     if (this.win && !this.win.isDestroyed()) {
       this.win.show();
       this.win.focus();
@@ -42,10 +132,13 @@ class Ui {
     const __dirname = path.dirname(__filename);
 
     this.win = new BrowserWindow({
-      width: 900,
-      height: 600,
+      width: 980,
+      height: 760,
+      minWidth: 760,
+      minHeight: 480,
       frame: false,
       show: false,
+      backgroundColor: '#1f2b33',
       webPreferences: {
         contextIsolation: true,
         preload: path.join(__dirname, '../renderer/preload.js'),
@@ -54,50 +147,110 @@ class Ui {
 
     this.win.loadFile(path.join(__dirname, '../renderer/index.html'));
     this.win.once('ready-to-show', () => this.win?.show());
-    this.win.setAlwaysOnTop(false);
+    this.win.setAlwaysOnTop(alwaysOnTop);
 
     this.win.on('closed', () => {
       this.win = undefined;
     });
   }
 
-  public sendCards(cards: FurniCard[]) {
+  public setAlwaysOnTop(state: boolean) {
+    this.win?.setAlwaysOnTop(state);
+  }
+
+  // The window usually sits behind the game: blink in the taskbar when a run ends
+  public flash() {
+    const win = this.win;
+    if (!win || win.isDestroyed() || win.isFocused()) return;
+    win.flashFrame(true);
+    win.once('focus', () => win.flashFrame(false));
+  }
+
+  public sendState(state: AppState) {
     if (!this.win || this.win.isDestroyed()) return;
-
-    const sorted = cards.sort((a, b) =>
-      b.quantity - a.quantity || a.name.localeCompare(b.name)
-    );
-
-    this.win.webContents.send('load-cards', sorted);
-  }
-
-  public notifyFurniDataLoaded(loaded: boolean) {
-    this.win?.webContents.send('furni-data-loaded', loaded);
-  }
-
-  public sendRecycleList(queue: FurniCard[]) {
-    this.win?.webContents.send('recycle-list:update', queue);
-  }
-
-  public toggleRecycler(running: boolean){
-    if(running){
-      this.win?.webContents.send('on-recycle-on');
-    } else {
-      this.win?.webContents.send('on-recycle-off');
-    }
+    this.win.webContents.send('state', state);
   }
 }
 
 class GFurniMatic {
-  private readonly ui: Ui;
+  private readonly ui = new Ui();
   private readonly ext: Extension;
-  private furniture: Map<number, RecycleFurni> = new Map();
+  private readonly settingsFile = path.join(app.getPath('userData'), 'settings.json');
+  private settings: Settings = this.loadSettings();
+
+  private hotel: string | null = null;
   private furniData?: FurniData;
-  private furniDataReady!: Promise<void>;
+  private furniDataStatus: AppState['furniData'] = 'waiting';
+  private readonly furniDataReady: Promise<void>;
   private resolveFurniDataReady!: () => void;
-  private recycleQueue: FurniCard[] = [];
-  private interval?: NodeJS.Timeout | null;
-  private queue: Map<number, RecycleFurni> = new Map();
+
+  private furniture: Map<number, RecycleFurni> = new Map();
+  private inventoryStatus: AppState['inventory']['status'] = 'idle';
+  private inventoryProgress: [number, number] | null = null;
+  private inventoryVersion = 0;
+  private inventoryRequest: InventoryRequest = 'RequestFurniInventory';
+  private inventoryTimer?: NodeJS.Timeout;
+
+  // typeId -> how many of that furni to keep, in the order they were queued
+  private queue: Map<number, number> = new Map();
+  private allowed: Set<number> = new Set();
+  private prices: Map<number, PriceInfo> = new Map();
+  private priceAt: Map<number, number> = new Map();
+  private priceQueue: number[] = [];
+  private pricePending?: { typeId: number; timer: NodeJS.Timeout };
+  private saveTimers: Map<string, NodeJS.Timeout> = new Map();
+
+  // The Furni-Matic's prize table: which furni can come out of a box, at which level and how often
+  private prizeTable: Map<string, { level: number; odds: number }> = new Map();
+  private prizeLevels: PrizeLevel[] = [];
+  private awaitingPrizes = false;
+
+  private recycler: Pick<RecyclerState, 'running' | 'phase' | 'cooldownUntil' | 'cooldownTotal' | 'batchesSent' | 'notice'> = {
+    running: false,
+    phase: 'idle',
+    cooldownUntil: null,
+    cooldownTotal: null,
+    batchesSent: 0,
+    notice: null,
+  };
+  private runBatches = 0;
+  private runStartedAt = 0;
+  private runOnce = false;
+  private pendingBatch?: HInventoryItem[];
+  private loopTimer?: NodeJS.Timeout;
+  private hotelTimer?: NodeJS.Timeout;
+  private lastSentAt = 0;
+  private lastBatchAt = 0;
+
+  // The hotel's answers to our own requests are kept from the game, or it plays sounds and shows
+  // popups for things the person never did in the client
+  private awaitingStatus = false;
+  private ownActionAt = 0;
+
+  private duckets: number | null = null;
+  private batchCost: number | null = null;
+  private loot: LootEntry[] = [];
+  private lootKey = 0;
+
+  private room: { id: number; owner: boolean } | null = null;
+  private roomUnknown = false;
+  // Prize boxes in the inventory by furni id, with the id the inventory uses to place them. A box only
+  // gets a line in the prize log once it's opened, so a box can never show up twice
+  private boxes: Map<number, PrizeBox> = new Map();
+  private boxQueue: number[] = [];
+  private boxRun: { done: number; total: number } | null = null;
+  private boxFailed: BoxState['failed'] = null;
+  private boxJob?: BoxJob;
+  private boxTimer?: NodeJS.Timeout;
+  private pickingSpot = false;
+  // Boxes owed by finished batches that haven't shown up in the inventory yet (below 0 when a box
+  // arrived before its RecyclerFinished)
+  private boxesOwed = 0;
+  private boxCheckTimer?: NodeJS.Timeout;
+  private openBoxesAfterRefresh = false;
+
+  private statePending = false;
+
   constructor() {
     const extensionInfo = JSON.parse(
       readFileSync(new URL('./extension.json', import.meta.url)).toString()
@@ -107,225 +260,1159 @@ class GFurniMatic {
       this.resolveFurniDataReady = resolve;
     });
 
-    this.ext = new Extension(extensionInfo);
-    this.ui = new Ui(this.ext);
+    // G-Earth passes -p when it launches the extension; fall back to its default port when run standalone
+    const args = process.argv.some((arg) => ['-p', '--port'].includes(arg.toLowerCase()))
+      ? process.argv
+      : [...process.argv, '-p', '9092'];
 
-    this.ext.on('click', () => this.initExtension());
-    this.ext.on('connect', (host: string) => this.loadFurniData(host));
+    this.ext = new Extension(extensionInfo, args);
+    this.loadLoot();
+
+    this.ext.on('click', () => this.openUi());
+    this.ext.on('connect', (host: string) => this.onConnect(host));
+    // G-Earth (and the extension store) expect the process to end once the connection is gone
+    this.ext.on('socketdisconnect', () => app.quit());
     this.ext.run();
 
     this.registerInterceptors();
-    this.setupRecycleQueueHandlers();
-
-    ipcMain.on('refresh', () => this.refreshInventory());
-    ipcMain.on('recycle', () => this.recycle())
+    this.registerIpc();
   }
 
-  private async loadFurniData(host: string) {
-    const hostToHotel: Record<string, Hotel> = {
-      'game-nl.habbo.com': Hotel.NL,
-      'game-br.habbo.com': Hotel.COMBR,
-      'game-tr.habbo.com': Hotel.COMTR,
-      'game-de.habbo.com': Hotel.DE,
-      'game-fr.habbo.com': Hotel.FR,
-      'game-fi.habbo.com': Hotel.FI,
-      'game-es.habbo.com': Hotel.ES,
-      'game-it.habbo.com': Hotel.IT,
-      'game-us.habbo.com': Hotel.COM,
-      'game-s2.habbo.com': Hotel.SANDBOX,
+  // A packet that doesn't look like expected (the hotel changes them now and then) is logged and
+  // skipped: it must never take the extension down with an error dialog
+  private safely(name: string, handler: (hMessage: HMessage) => unknown) {
+    return (hMessage: HMessage) => {
+      const fail = (err: unknown) => console.error(`Couldn't handle ${name}:`, err);
+      try {
+        Promise.resolve(handler.call(this, hMessage)).catch(fail);
+      } catch (err) {
+        fail(err);
+      }
     };
-
-    const hotel = hostToHotel[host];
-    if (!hotel) {
-      console.warn(`Unknown hotel host: ${host}`);
-      this.ui.notifyFurniDataLoaded(false);
-      return;
-    }
-
-    if (this.furniData) {
-      this.ui.notifyFurniDataLoaded(true);
-      return;
-    }
-
-    try {
-      this.furniData = await FurniDataUtils.fetch(hotel);
-      this.resolveFurniDataReady();
-      this.ui.notifyFurniDataLoaded(true);
-    } catch (err) {
-      console.error('Failed to load furnidata:', err);
-      this.ui.notifyFurniDataLoaded(false);
-    }
   }
 
   private registerInterceptors() {
-    this.ext.interceptByNameOrHash(
-      HDirection.TOCLIENT,
-      'FurniList',
-      this.addFurnitureToInventory.bind(this)
-    );
+    const on = (name: string, handler: (hMessage: HMessage) => unknown) =>
+      this.ext.interceptByNameOrHash(HDirection.TOCLIENT, name, this.safely(name, handler));
+
+    on('FurniList', this.onFurniList);
+    on('FurniListAddOrUpdate', this.onFurniListAddOrUpdate);
+    on('FurniListRemove', this.onFurniListRemove);
+    on('FurniListInvalidate', () => {
+      if (this.inventoryStatus !== 'idle') this.refreshInventory();
+    });
+    on('RecyclerStatus', this.onRecyclerStatus);
+    on('RecyclerPrizes', this.onRecyclerPrizes);
+    on('RecyclerFinished', this.onRecyclerFinished);
+    on('PresentOpened', this.onPresentOpened);
+    on('MarketplaceItemStats', this.onMarketplaceItemStats);
+    on('ActivityPoints', this.onActivityPoints);
+    on('HabboActivityPointNotification', this.onActivityPointNotification);
+    on('RoomEntryInfo', this.onRoomEntryInfo);
+    on('CloseConnection', this.leaveRoom);
+    on('ObjectAdd', this.onObjectAdd);
+    on('ObjectRemove', this.onObjectRemove);
+    this.ext.interceptByNameOrHash(HDirection.TOSERVER, 'OpenFlatConnection', this.safely('OpenFlatConnection', this.leaveRoom));
+    this.ext.interceptByNameOrHash(HDirection.TOSERVER, 'MoveAvatar', this.safely('MoveAvatar', this.onMoveAvatar));
+
+    // "New item" badges and hotel popups that follow a batch or a box we opened
+    const hideEcho = (hMessage: HMessage) => {
+      if (this.isEcho()) hMessage.blocked = true;
+    };
+    on('UnseenItems', hideEcho);
+    on('NotificationDialog', hideEcho);
   }
 
-  private async addFurnitureToInventory(hMessage: HMessage) {
+  private isEcho() {
+    return Date.now() - this.ownActionAt < ECHO_WINDOW;
+  }
+
+  private registerIpc() {
+    const isId = (value: unknown): value is number => Number.isInteger(value);
+
+    // The window asks for the whole state when it loads, then gets every change pushed
+    ipcMain.handle('state:get', () => this.snapshot());
+
+    ipcMain.on('inventory:refresh', () => this.refreshInventory());
+    ipcMain.on('queue:toggle', (_event, typeId: unknown) => {
+      if (isId(typeId)) this.toggleQueue(typeId);
+    });
+    ipcMain.on('queue:keep', (_event, typeId: unknown, keep: unknown) => {
+      if (isId(typeId) && Number.isFinite(keep)) this.setKeep(typeId, keep as number);
+    });
+    ipcMain.on('queue:allow', (_event, typeId: unknown) => {
+      if (isId(typeId)) this.toggleAllowed(typeId);
+    });
+    // The answer to the "too expensive" warning: these go into batches despite the price limit
+    ipcMain.on('queue:allowMany', (_event, typeIds: unknown) => {
+      if (!Array.isArray(typeIds)) return;
+      for (const typeId of typeIds.filter(isId)) if (this.queue.has(typeId)) this.allowed.add(typeId);
+      this.pushState();
+    });
+    ipcMain.on('queue:remove', (_event, typeId: unknown) => {
+      if (isId(typeId)) this.removeFromQueue(typeId);
+    });
+    ipcMain.on('queue:addMany', (_event, typeIds: unknown) => {
+      if (Array.isArray(typeIds)) this.addManyToQueue(typeIds.filter(isId));
+    });
+    ipcMain.on('queue:clear', () => this.clearQueue());
+    ipcMain.on('furni:lock', (_event, typeId: unknown) => {
+      if (isId(typeId)) this.toggleLock(typeId);
+    });
+    ipcMain.on('recycler:start', () => this.start(false));
+    ipcMain.on('recycler:once', () => this.start(true));
+    ipcMain.on('recycler:stop', () => this.stop());
+    ipcMain.on('boxes:open', () => this.openBoxes([...this.boxes.keys()]));
+    ipcMain.on('boxes:stop', () => this.stopBoxes());
+    ipcMain.on('boxes:pickSpot', (_event, picking: unknown) => this.setPickingSpot(picking === true));
+    // Locks and box tiles have their own actions; the window only edits the plain options
+    ipcMain.on('settings:update', (_event, patch: unknown) => {
+      if (!patch || typeof patch !== 'object') return;
+      const { locked, spots, ...options } = patch as Partial<Settings>;
+      this.updateSettings(options);
+    });
+  }
+
+  private openUi() {
+    this.ui.startUi(this.settings.alwaysOnTop);
+    this.refreshInventory();
+    this.requestPrizeTable();
+  }
+
+  // ---- Files next to the settings: prize log and Marketplace prices ----
+
+  private dataFile(name: string) {
+    return path.join(path.dirname(this.settingsFile), name);
+  }
+
+  private readData<T>(name: string, fallback: T): T {
+    try {
+      return JSON.parse(readFileSync(this.dataFile(name), 'utf8'));
+    } catch {
+      return fallback;
+    }
+  }
+
+  // Writes are bundled: a batch can change the log and several prices within a second
+  private saveSoon(name: string, data: () => unknown) {
+    clearTimeout(this.saveTimers.get(name));
+    this.saveTimers.set(name, setTimeout(() => {
+      try {
+        mkdirSync(path.dirname(this.settingsFile), { recursive: true });
+        writeFileSync(this.dataFile(name), JSON.stringify(data()));
+      } catch (err) {
+        console.error(`Could not save ${name}:`, err);
+      }
+    }, 1000));
+  }
+
+  private loadLoot() {
+    const saved = this.readData<LootEntry[]>('prizes.json', []);
+    // A box that was opening when the app closed never got its answer
+    this.loot = saved.filter((entry) => entry.status === 'opened');
+    this.lootKey = Math.max(0, ...this.loot.map((entry) => entry.key));
+  }
+
+  private saveLoot() {
+    this.saveSoon('prizes.json', () => this.loot);
+  }
+
+  private pricesFile() {
+    return `prices-${this.hotel ?? 'unknown'}.json`;
+  }
+
+  private loadPrices() {
+    const saved = this.readData<Record<string, { price: PriceInfo; at: number }>>(this.pricesFile(), {});
+    for (const [typeId, { price, at }] of Object.entries(saved)) {
+      if (Date.now() - at > PRICE_TTL) continue;
+      this.prices.set(Number(typeId), price);
+      this.priceAt.set(Number(typeId), at);
+    }
+  }
+
+  private savePrices() {
+    const file = this.pricesFile();
+    this.saveSoon(file, () => {
+      const out: Record<number, { price: PriceInfo; at: number }> = {};
+      for (const [typeId, price] of this.prices) {
+        const at = this.priceAt.get(typeId);
+        if (at && (price.status === 'known' || price.status === 'none')) out[typeId] = { price, at };
+      }
+      return out;
+    });
+  }
+
+  // ---- Prize table ----
+
+  private requestPrizeTable() {
+    if (this.prizeLevels.length > 0 || this.awaitingPrizes || !this.hotel) return;
+    this.awaitingPrizes = true;
+    this.ext.sendToServer(new HPacket('GetRecyclerPrizes', HDirection.TOSERVER));
+    setTimeout(() => (this.awaitingPrizes = false), STATUS_TIMEOUT);
+  }
+
+  private onRecyclerPrizes(hMessage: HMessage) {
+    if (this.awaitingPrizes) hMessage.blocked = true; // the game's own catalog page still gets its copy
+    this.awaitingPrizes = false;
+
+    const levels = this.readPrizeTable(hMessage.getPacket());
+    if (!levels) {
+      console.warn('RecyclerPrizes came in a layout this version does not know; prizes are logged without rarity');
+      return;
+    }
+
+    this.prizeTable.clear();
+    for (const { level, odds, prizes } of levels) {
+      for (const [type, typeId] of prizes) this.prizeTable.set(`${type.toLowerCase()}${typeId}`, { level, odds });
+    }
+
+    // Rarity goes by how unlikely a level is, whatever number the hotel gives it
+    const byOdds = levels.map(({ level, odds }) => ({ level, odds })).sort((a, b) => a.odds - b.odds);
+    const top = Math.max(1, byOdds.length - 1);
+    this.prizeLevels = byOdds.map((entry, rank) => ({ ...entry, tier: Math.round((rank * 4) / top) }));
+    this.pushState();
+  }
+
+  // The prize table has had several shapes over the client versions. Each level is always
+  // [level][1 in N][prize count]; what changes is each prize. The right shape is the one that reads
+  // the packet to its last byte
+  private readPrizeTable(packet: HPacket) {
+    const products = (): [string, number][] => {
+      const size = packet.readInteger();
+      if (size < 0 || size > 50) throw new Error(`unlikely bundle size ${size}`);
+      return size <= 1 ? [packet.read('Si') as [string, number]] : Array.from({ length: size }, () => packet.read('Si') as [string, number]);
+    };
+    const prizeShapes = [
+      () => (packet.readString(), products()),                         // [code][size][type][id]...
+      () => (packet.readInteger(), packet.readString(), products()),   // [?][code][size][type][id]...
+      () => [packet.read('Si') as [string, number]],                   // [type][id], older clients
+    ];
+
+    for (const readPrize of prizeShapes) {
+      try {
+        packet.resetReadIndex();
+        const levels: { level: number; odds: number; prizes: [string, number][] }[] = [];
+        const levelCount = packet.readInteger();
+        if (levelCount < 1 || levelCount > 20) continue;
+
+        for (let i = 0; i < levelCount; i++) {
+          const [level, odds, count] = packet.read('iii');
+          if (odds < 1 || count < 0 || count > 2000) throw new Error('unlikely level');
+          const prizes: [string, number][] = [];
+          for (let j = 0; j < count; j++) prizes.push(...readPrize());
+          levels.push({ level, odds, prizes });
+        }
+        if (packet.readIndex === packet.getBytesLength()) return levels;
+      } catch {
+        // not this shape
+      }
+    }
+    return null;
+  }
+
+  private prizeInfo(type: string, typeId: number) {
+    const prize = this.prizeTable.get(`${type.toLowerCase()}${typeId}`);
+    if (!prize) return { level: null, odds: null, tier: null };
+    const tier = this.prizeLevels.find((entry) => entry.level === prize.level)?.tier ?? null;
+    return { ...prize, tier };
+  }
+
+  private async onConnect(host: string) {
+    const known = HOTELS[host];
+    if (!known) console.warn(`Unknown hotel host: ${host}`);
+
+    // Duckets aren't asked for: the balance comes with the hotel's own updates, and every extra
+    // request is one more thing happening that the person didn't do
+    this.hotel = known?.name ?? host;
+    this.loadPrices();
+    if (this.ui.win) {
+      this.refreshInventory();
+      this.requestPrizeTable();
+    }
+    this.pushState();
+
+    await this.loadFurniData(known?.hotel);
+  }
+
+  private async loadFurniData(hotel?: Hotel) {
+    if (this.furniData) return;
+    if (!hotel) {
+      this.furniDataStatus = 'failed';
+      this.pushState();
+      return;
+    }
+
+    this.furniDataStatus = 'loading';
+    this.pushState();
+
+    try {
+      this.furniData = await FurniDataUtils.fetch(hotel);
+      this.furniDataStatus = 'ready';
+      this.resolveFurniDataReady();
+    } catch (err) {
+      console.error('Failed to load furnidata:', err);
+      this.furniDataStatus = 'failed';
+    }
+    this.pushState();
+  }
+
+  // ---- Inventory ----
+
+  private refreshInventory() {
+    this.inventoryStatus = 'loading';
+    this.inventoryProgress = null;
+    this.requestInventory(true);
+    this.pushState();
+  }
+
+  private requestInventory(canRetry: boolean) {
+    clearTimeout(this.inventoryTimer);
+    this.ext.sendToServer(new HPacket(this.inventoryRequest, HDirection.TOSERVER));
+
+    // Outside a room the hotel ignores the in-room request (and the other way round), so try the other one
+    this.inventoryTimer = setTimeout(() => {
+      if (canRetry) {
+        this.inventoryRequest =
+          this.inventoryRequest === 'RequestFurniInventory'
+            ? 'RequestFurniInventoryWhenNotInRoom'
+            : 'RequestFurniInventory';
+        this.requestInventory(false);
+      } else {
+        this.inventoryStatus = 'failed';
+        this.pushState();
+      }
+    }, INVENTORY_TIMEOUT);
+  }
+
+  private async onFurniList(hMessage: HMessage) {
+    clearTimeout(this.inventoryTimer);
+
+    const packet = hMessage.getPacket();
+    const fragments = packet.readInteger(6);
+    const fragment = packet.readInteger(10);
+    const items = HInventoryItem.parse(packet);
+
     await this.furniDataReady;
     if (!this.furniData) return;
 
-    const items = HInventoryItem.parse(hMessage.getPacket()).filter(
-      (item) => item.isRecyclable
-    );
+    // The game asks for the inventory too: a new first fragment is a fresh copy, not more furni
+    if (fragment === 0) {
+      this.furniture.clear();
+      this.boxes = new Map();
+    }
 
     for (const item of items) {
+      const furniData =
+        item.furniType === HProductType.WallItem
+          ? this.furniData.getWallItemByTypeId(item.typeId)
+          : this.furniData.getFloorItemByTypeId(item.typeId);
+
+      if (isPrizeBox(furniData)) {
+        this.boxes.set(item.id, { placeId: item.itemId });
+        continue;
+      }
+      if (!canRecycle(item)) continue;
+
       const existing = this.furniture.get(item.typeId);
+      if (existing) existing.items.push(item);
+      else this.furniture.set(item.typeId, { items: [item], data: furniData });
+    }
 
-      if (existing) {
-        existing.items.push(item);
-      } else {
-        const furniData =
-          this.furniData.getFloorItemByTypeId(item.typeId) ||
-          this.furniData.getWallItemByTypeId(item.typeId);
-
-        this.furniture.set(item.typeId, {
-          items: [item],
-          data: furniData,
-        });
+    this.inventoryProgress = [fragment + 1, fragments];
+    if (fragment + 1 >= fragments) {
+      this.inventoryStatus = 'ready';
+      for (const typeId of this.queue.keys()) {
+        if (this.recyclableCount(typeId) === 0) this.queue.delete(typeId);
+      }
+      this.checkInventoryPrices();
+      if (this.openBoxesAfterRefresh) {
+        this.openBoxesAfterRefresh = false;
+        this.autoOpen([...this.boxes.keys()]);
       }
     }
-
-    const cards: FurniCard[] = Array.from(this.furniture.entries()).map(
-      ([typeId, furni]) => ({
-        imgUrl: `https://images.habbo.com/dcr/hof_furni/${furni.data?.revision}/${furni.data?.classname}_icon.png`,
-        quantity: furni.items.length,
-        recycleQuantity: furni.items.length, // default to max available
-        name: furni.data?.name || `Unknown (${typeId})`,
-        typeId
-      })
-    );
-
-
-    this.ui.sendCards(cards);
+    this.inventoryVersion++;
+    this.pushState();
   }
 
-  private initExtension() {
-    this.refreshInventory();
-    this.ui.startUi();
-  }
+  private removeFromInventory(batch: HInventoryItem[]) {
+    const recycled = new Set(batch.map((item) => item.id));
 
-  private refreshInventory() {
-    this.furniture.clear();
-    this.ext.sendToServer(
-      new HPacket('RequestFurniInventory', HDirection.TOSERVER)
-    );
-  }
+    for (const typeId of new Set(batch.map((item) => item.typeId))) {
+      const furni = this.furniture.get(typeId);
+      if (!furni) continue;
 
-  private recycleItemsInQueue(){
-    const itemsToRecycle = [];
-    console.log(this.queue)
-    for(const furni of this.queue.values()){
-      if(itemsToRecycle.length  === 8 ) break;
-      for(const item in furni.items){
-        if(itemsToRecycle.length  === 8 ) break;
-        itemsToRecycle.push(furni.items[item])
-      }
+      furni.items = furni.items.filter((item) => !recycled.has(item.id));
+      if (furni.items.length === 0) this.furniture.delete(typeId);
+      if (this.recyclableCount(typeId) === 0) this.queue.delete(typeId);
     }
-    const packet = new HPacket('RecycleItems', HDirection.TOSERVER);
-    packet.appendInt(8);
-    for(const item in itemsToRecycle){
-      console.log(`Adding item to recycle ${itemsToRecycle[item].itemId}`)
-      packet.appendInt(-(itemsToRecycle[item].id))
-    }
-    this.ext.sendToServer(packet)
-    this.internalRemoveInventory(itemsToRecycle)
+    this.inventoryVersion++;
   }
 
-  private internalRemoveInventory(items: HInventoryItem[]){
-    items.forEach(el => {
-      const furniture = this.furniture.get(el.typeId)
-      this.furniture.set(el.typeId, {...furniture, items: furniture?.items.filter(i => i.id != el.id)} as RecycleFurni)
-      this.queue.set(el.typeId, {...furniture, items: furniture?.items.filter(i => i.id != el.id)} as RecycleFurni)
-    })
-    this.updateUiCards()
+  private isLocked(furni: RecycleFurni) {
+    return !!furni.data && this.settings.locked.includes(furni.data.classname);
   }
 
-  private updateUiCards(){
-      const cards: FurniCard[] = Array.from(this.furniture.entries()).map(
-      ([typeId, furni]) => ({
-        imgUrl: `https://images.habbo.com/dcr/hof_furni/${furni.data?.revision}/${furni.data?.classname}_icon.png`,
-        quantity: furni.items.length,
-        name: furni.data?.name || `Unknown (${typeId})`,
-        typeId: typeId,
-      })
-    );
+  private toggleLock(typeId: number) {
+    const classname = this.furniture.get(typeId)?.data?.classname;
+    if (!classname) return;
 
-    cards.forEach(el => {
-      this.updateRecycleQuantity(el.typeId, el.quantity)
-    })
-    this.ui.sendCards(cards);
-  }
-
-  private recycle(){
-    if(!this.interval){
-      this.ui.toggleRecycler(true)
-      this.interval = setInterval(this.recycleItemsInQueue.bind(this), 15000)
+    const locked = new Set(this.settings.locked);
+    if (locked.has(classname)) {
+      locked.delete(classname);
     } else {
-      clearInterval(this.interval)
-      this.ui.toggleRecycler(false)
-      console.log('STOPPED RECYCLING')
-      this.interval = null;
+      locked.add(classname);
+      this.queue.delete(typeId);
+    }
+
+    this.inventoryVersion++;
+    this.updateSettings({ locked: [...locked] });
+  }
+
+  // ---- Queue ----
+
+  private toggleQueue(typeId: number) {
+    if (this.queue.has(typeId)) this.removeFromQueue(typeId);
+    else this.addToQueue(typeId);
+  }
+
+  private addToQueue(typeId: number) {
+    const furni = this.furniture.get(typeId);
+    if (!furni || this.isLocked(furni) || this.queue.has(typeId)) return;
+
+    this.queue.set(typeId, Math.min(this.settings.defaultKeep, furni.items.length));
+    this.requestPrice(typeId);
+    this.pushState();
+  }
+
+  private addManyToQueue(typeIds: number[]) {
+    for (const typeId of typeIds) this.addToQueue(typeId);
+  }
+
+  private setKeep(typeId: number, keep: number) {
+    const furni = this.furniture.get(typeId);
+    if (!furni || !this.queue.has(typeId)) return;
+
+    this.queue.set(typeId, Math.max(0, Math.min(Math.floor(keep), furni.items.length)));
+    this.pushState();
+  }
+
+  private toggleAllowed(typeId: number) {
+    if (this.allowed.has(typeId)) this.allowed.delete(typeId);
+    else this.allowed.add(typeId);
+    this.pushState();
+  }
+
+  private removeFromQueue(typeId: number) {
+    this.queue.delete(typeId);
+    this.allowed.delete(typeId);
+    this.pushState();
+  }
+
+  private clearQueue() {
+    this.queue.clear();
+    this.allowed.clear();
+    this.pushState();
+  }
+
+  private recyclableCount(typeId: number) {
+    const available = this.furniture.get(typeId)?.items.length ?? 0;
+    return Math.max(0, available - (this.queue.get(typeId) ?? 0));
+  }
+
+  private isHeldBack(typeId: number) {
+    if (this.settings.priceCap === 0 || this.allowed.has(typeId)) return false;
+
+    const price = this.prices.get(typeId);
+    if (!price || price.status === 'loading' || price.status === 'failed') return true;
+    return price.status === 'known' && price.average > this.settings.priceCap;
+  }
+
+  private isPriceLoading(typeId: number) {
+    return this.prices.get(typeId)?.status === 'loading';
+  }
+
+  private nextBatch() {
+    const batch: HInventoryItem[] = [];
+
+    for (const typeId of this.queue.keys()) {
+      if (this.isHeldBack(typeId)) continue;
+
+      const take = Math.min(this.recyclableCount(typeId), BATCH_SIZE - batch.length);
+      batch.push(...(this.furniture.get(typeId)?.items.slice(0, take) ?? []));
+      if (batch.length === BATCH_SIZE) break;
+    }
+
+    return batch;
+  }
+
+  private totals() {
+    let recyclable = 0;
+    let heldBack = 0;
+    let checking = 0;
+
+    for (const typeId of this.queue.keys()) {
+      const count = this.recyclableCount(typeId);
+      if (!this.isHeldBack(typeId)) recyclable += count;
+      else if (this.isPriceLoading(typeId)) checking += count;
+      else heldBack += count;
+    }
+
+    return {
+      batchesLeft: Math.floor(recyclable / BATCH_SIZE),
+      leftover: recyclable % BATCH_SIZE,
+      heldBack,
+      checking,
+    };
+  }
+
+  // ---- Marketplace prices ----
+
+  // Queued furni jump ahead; the rest of the inventory is checked in the background so furni over
+  // the safe price can be kept out of the list
+  private requestPrice(typeId: number, urgent = true) {
+    const known = this.prices.get(typeId);
+    if (known?.status === 'loading') {
+      if (urgent && this.priceQueue.includes(typeId)) {
+        this.priceQueue = [typeId, ...this.priceQueue.filter((id) => id !== typeId)];
+      }
+      return;
+    }
+    if (known && known.status !== 'failed' && Date.now() - (this.priceAt.get(typeId) ?? Date.now()) < PRICE_TTL) return;
+
+    const furni = this.furniture.get(typeId);
+    if (!furni) return;
+
+    if (!furni.items[0].isSellable) {
+      this.prices.set(typeId, { status: 'unsellable' });
+      return;
+    }
+
+    this.prices.set(typeId, { status: 'loading' });
+    if (urgent) this.priceQueue.unshift(typeId);
+    else this.priceQueue.push(typeId);
+    this.nextPriceRequest();
+  }
+
+  private checkInventoryPrices() {
+    for (const typeId of this.furniture.keys()) this.requestPrice(typeId, false);
+    this.pushState();
+  }
+
+  // One request at a time, so a long queue doesn't flood the hotel
+  private nextPriceRequest() {
+    if (this.pricePending) return;
+
+    const typeId = this.priceQueue.shift();
+    if (typeId === undefined) return;
+
+    const furni = this.furniture.get(typeId);
+    if (!furni) {
+      this.prices.delete(typeId);
+      this.nextPriceRequest();
+      return;
+    }
+
+    const category = furni.items[0].furniType === HProductType.WallItem ? 2 : 1;
+    this.ext.sendToServer(
+      new HPacket('GetMarketplaceItemStats', HDirection.TOSERVER).appendInt(category).appendInt(typeId)
+    );
+    this.pricePending = {
+      typeId,
+      timer: setTimeout(() => this.settlePrice(typeId, { status: 'failed' }), PRICE_TIMEOUT),
+    };
+  }
+
+  private settlePrice(typeId: number, price: PriceInfo) {
+    if (this.pricePending?.typeId !== typeId) return;
+
+    clearTimeout(this.pricePending.timer);
+    this.pricePending = undefined;
+    this.prices.set(typeId, price);
+    this.priceAt.set(typeId, Date.now());
+    this.savePrices();
+    this.pushState();
+    setTimeout(() => this.nextPriceRequest(), PRICE_GAP);
+  }
+
+  private onMarketplaceItemStats(hMessage: HMessage) {
+    const packet = hMessage.getPacket();
+    const [average, , , points] = packet.read('iiii');
+    for (let i = 0; i < points * 3; i++) packet.readInteger();
+    const [, typeId] = packet.read('ii');
+
+    if (this.pricePending?.typeId !== typeId) return; // the game's own Marketplace window asked
+    hMessage.blocked = true;
+    this.settlePrice(typeId, average > 0 ? { status: 'known', average } : { status: 'none' });
+  }
+
+  // ---- Recycler ----
+
+  // Keeps feeding batches until the queue can't fill another one, or just one batch when asked
+  private start(once: boolean) {
+    if (this.recycler.running) return;
+
+    this.recycler.running = true;
+    this.recycler.notice = null;
+    this.runOnce = once;
+    this.runBatches = 0;
+    this.runStartedAt = Date.now();
+    this.checkRecycler();
+  }
+
+  // Stopping by itself (with a notice) means the run is over: worth a blink if the window is behind the game
+  private stop(notice: Notice | null = null) {
+    clearTimeout(this.loopTimer);
+    this.recycler.running = false;
+    this.recycler.notice = notice;
+    // A batch already sent still gets its answer, so the inventory stays right
+    if (!this.pendingBatch) this.setPhase('idle');
+    if (notice) this.ui.flash();
+    this.pushState();
+  }
+
+  private notice(tone: Notice['tone'], code: Notice['code'], values: Notice['values'] = {}): Notice {
+    return { tone, code, values };
+  }
+
+  private setPhase(phase: RecyclerPhase, cooldown?: number) {
+    this.recycler.phase = phase;
+    this.recycler.cooldownTotal = cooldown ?? null;
+    this.recycler.cooldownUntil = cooldown ? Date.now() + cooldown : null;
+    this.pushState();
+  }
+
+  private checkRecycler() {
+    this.setPhase('checking');
+    this.awaitingStatus = true;
+    this.ext.sendToServer(new HPacket('GetRecyclerStatus', HDirection.TOSERVER));
+    this.loopTimer = setTimeout(() => {
+      this.awaitingStatus = false;
+      this.feedBatch();
+    }, STATUS_TIMEOUT);
+  }
+
+  private wait(ms: number, then: () => void) {
+    this.setPhase('cooldown', ms);
+    this.loopTimer = setTimeout(then, ms);
+  }
+
+  private onRecyclerStatus(hMessage: HMessage) {
+    if (!this.awaitingStatus) return; // the game's own recycler window asked
+    this.awaitingStatus = false;
+    hMessage.blocked = true;
+
+    if (!this.recycler.running || this.recycler.phase !== 'checking') return;
+    clearTimeout(this.loopTimer);
+
+    const [status, seconds] = hMessage.getPacket().read('ii');
+    const gap = this.lastBatchAt + MIN_BATCH_GAP - Date.now();
+
+    if (status === RECYCLER_OPEN) {
+      if (gap > 0) this.wait(gap, () => this.feedBatch());
+      else this.feedBatch();
+    } else if (status === RECYCLER_COOLDOWN) {
+      this.wait(Math.max(seconds * 1000, gap), () => this.checkRecycler());
+    } else {
+      this.stop(this.notice('error', 'closed'));
     }
   }
-  private updateRecycleQuantity(typeId: number, newQuantity: number) {
-  // find queued card
-  const card = this.recycleQueue.find(c => c.typeId === typeId);
-  if (!card) return;
 
-  // clamp to available
-  const max = this.queue.get(typeId)?.items.length ?? card.quantity ?? 1;
-  const clamped = Math.max(1, Math.min(newQuantity | 0, max));
+  private feedBatch() {
+    if (!this.recycler.running) return;
 
-  // store chosen amount separately (don’t destroy original quantity)
-  (card as any).recycleQuantity = clamped;
+    const batch = this.nextBatch();
+    if (batch.length < BATCH_SIZE) {
+      // A refresh or a price check in progress can still complete the batch
+      if (this.inventoryStatus === 'loading' || this.totals().checking > 0) {
+        this.setPhase('checking');
+        this.loopTimer = setTimeout(() => this.feedBatch(), 1000);
+      } else {
+        this.stop(this.finishedNotice());
+      }
+      return;
+    }
 
-  // if you also mirror in queue map (optional):
-  const furni = this.queue.get(typeId);
-  if (furni) {
-    furni.items = furni.items.slice(0, clamped);
-    this.queue.set(typeId, furni);
+    if (this.batchCost !== null && this.duckets !== null && this.duckets < this.batchCost) {
+      this.stop(this.notice('error', 'duckets', { cost: this.batchCost, have: this.duckets }));
+      return;
+    }
+
+    // The count has to match the ids that follow it, or the hotel gets a broken packet
+    const packet = new HPacket('RecycleItems', HDirection.TOSERVER);
+    packet.appendInt(batch.length);
+    for (const item of batch) packet.appendInt(-item.id);
+    this.ext.sendToServer(packet);
+
+    this.pendingBatch = batch;
+    this.lastSentAt = this.ownActionAt = Date.now();
+    this.setPhase('recycling');
+
+    this.hotelTimer = setTimeout(() => {
+      this.pendingBatch = undefined;
+      this.stop(this.notice('error', 'noAnswer'));
+      this.refreshInventory();
+    }, FINISH_TIMEOUT);
   }
 
-  this.updateRecycleList();
-}
-private updateRecycleList() {
-  this.ui.win?.webContents.send('recycle-list:update', this.recycleQueue);
-}
+  private onRecyclerFinished(hMessage: HMessage) {
+    const batch = this.pendingBatch;
+    if (!batch) return;
 
-private setupRecycleQueueHandlers() {
-  ipcMain.handle('recycle:add', (_event, card: FurniCard) => {
-    if (this.recycleQueue.find(q => q.typeId === card.typeId)) return;
+    hMessage.blocked = true;
+    clearTimeout(this.hotelTimer);
+    this.pendingBatch = undefined;
+    this.ownActionAt = Date.now();
 
-    const pool = this.furniture.get(card.typeId);
-    const max = pool?.items.length ?? card.quantity ?? 1;
+    const [status] = hMessage.getPacket().read('i');
+    if (status !== RECYCLE_OK) {
+      this.stop(this.notice('error', 'refused'));
+      return;
+    }
 
-    // default: recycle all available unless changed later
-    this.recycleQueue.push({ ...card, recycleQuantity: max });
-    this.queue.set(card.typeId, pool as RecycleFurni);
-    this.updateRecycleList();
-  });
+    this.removeFromInventory(batch);
+    this.recycler.batchesSent++;
+    this.runBatches++;
+    this.lastBatchAt = Date.now();
+    this.expectPrizeBox();
 
-  ipcMain.handle('recycle:update', (_event, typeId: number, newQty: number) => {
-    this.updateRecycleQuantity(typeId, newQty);
-  });
+    if (!this.recycler.running) {
+      this.setPhase('idle');
+    } else if (this.runOnce) {
+      this.stop(this.notice('done', 'done', { recycled: BATCH_SIZE }));
+    } else if (this.nextBatch().length < BATCH_SIZE && this.totals().checking === 0) {
+      this.stop(this.finishedNotice());
+    } else {
+      this.checkRecycler();
+    }
+  }
 
-  ipcMain.handle('recycle:remove', (_event, typeId: number, cardName: string) => {
-    this.recycleQueue = this.recycleQueue.filter(c => c.typeId !== typeId && c.name !== cardName);
-    this.queue.delete(typeId);
-    this.updateRecycleList();
-  });
+  private finishedNotice(): Notice {
+    const { leftover, heldBack } = this.totals();
+    const recycled = this.runBatches * BATCH_SIZE;
 
-  ipcMain.handle('recycle:clear', () => {
-    this.recycleQueue = [];
-    this.queue.clear();
-    this.updateRecycleList();
-  });
-}
+    if (heldBack > 0) return this.notice('info', 'heldBack', { recycled, heldBack });
+    if (leftover > 0) return this.notice('info', 'leftover', { recycled, leftover, missing: BATCH_SIZE - leftover });
+    if (recycled > 0) return this.notice('done', 'done', { recycled });
+    return this.notice('info', 'needBatch', { size: BATCH_SIZE });
+  }
+
+  private cycleMs() {
+    return this.runBatches > 0 ? (this.lastBatchAt - this.runStartedAt) / this.runBatches : null;
+  }
+
+  // ---- Prize boxes ----
+
+  private newLoot(): LootEntry {
+    const entry: LootEntry = {
+      key: ++this.lootKey,
+      at: Date.now(),
+      status: 'boxed',
+      name: null,
+      imgUrl: null,
+      level: null,
+      odds: null,
+      tier: null,
+    };
+    this.loot = [entry, ...this.loot].slice(0, LOOT_LIMIT);
+    this.saveLoot();
+    return entry;
+  }
+
+  // Every finished batch owes a box. It normally arrives with its real ids in FurniListAddOrUpdate;
+  // if it doesn't, the inventory is read again instead of guessing the box from the prize id
+  private expectPrizeBox() {
+    this.boxesOwed++;
+    clearTimeout(this.boxCheckTimer);
+    this.boxCheckTimer = setTimeout(() => {
+      if (this.boxesOwed <= 0) return;
+      this.boxesOwed = 0;
+      this.openBoxesAfterRefresh = this.settings.autoOpen;
+      this.refreshInventory();
+    }, PRIZE_BOX_WAIT);
+  }
+
+  private autoOpen(ids: number[]) {
+    if (this.settings.autoOpen && this.canOpenBoxes()) setTimeout(() => this.openBoxes(ids), BOX_OPEN_DELAY);
+  }
+
+  // A list of furni (count first); a single furni as a fallback in case a hotel sends it bare
+  private readAddedItems(hMessage: HMessage) {
+    const packet = hMessage.getPacket();
+    try {
+      const count = packet.readInteger();
+      if (count < 0 || count > 500) throw new Error(`unlikely count ${count}`);
+      return Array.from({ length: count }, () => new HInventoryItem(packet));
+    } catch {
+      packet.resetReadIndex();
+      return [new HInventoryItem(packet)];
+    }
+  }
+
+  private onFurniListAddOrUpdate(hMessage: HMessage) {
+    const furniData = this.furniData;
+    if (!furniData) return;
+
+    for (const item of this.readAddedItems(hMessage)) {
+      const data =
+        item.furniType === HProductType.WallItem
+          ? furniData.getWallItemByTypeId(item.typeId)
+          : furniData.getFloorItemByTypeId(item.typeId);
+      if (!isPrizeBox(data) || this.boxes.has(item.id)) continue;
+
+      this.boxes.set(item.id, { placeId: item.itemId });
+      // Ours when a batch is in flight or owes its box; one from somewhere else just waits in the list
+      if (this.pendingBatch || this.boxesOwed > 0) {
+        this.boxesOwed--;
+        this.autoOpen([item.id]);
+      }
+    }
+    this.pushState();
+  }
+
+  // Furni that leave the inventory (placed, traded, sold) shouldn't end up in a batch
+  private onFurniListRemove(hMessage: HMessage) {
+    const removed = hMessage.getPacket().readInteger();
+    const matches = (itemId: number, id: number) => itemId === removed || id === Math.abs(removed);
+    let changed = false;
+
+    for (const [id, box] of this.boxes) {
+      if (id !== this.boxJob?.id && matches(box.placeId, id)) this.boxes.delete(id);
+    }
+
+    for (const [typeId, furni] of this.furniture) {
+      const left = furni.items.filter((item) => !matches(item.itemId, item.id));
+      if (left.length === furni.items.length) continue;
+
+      changed = true;
+      furni.items = left;
+      if (left.length === 0) this.furniture.delete(typeId);
+      if (this.recyclableCount(typeId) === 0) this.queue.delete(typeId);
+    }
+
+    if (changed) this.inventoryVersion++;
+    this.pushState();
+  }
+
+  // ---- Rooms ----
+
+  private onRoomEntryInfo(hMessage: HMessage) {
+    const [id, owner] = hMessage.getPacket().read('iB');
+    this.room = { id, owner };
+    this.roomUnknown = false;
+    this.boxFailed = null;
+    if (!owner) this.stopBoxes();
+    this.pushState();
+  }
+
+  private leaveRoom() {
+    this.roomUnknown = false;
+    if (!this.room) {
+      this.pushState();
+      return;
+    }
+    this.room = null;
+    this.pickingSpot = false;
+    this.stopBoxes();
+    this.pushState();
+  }
+
+  private spot() {
+    const tile = this.room ? this.settings.spots[this.room.id] : undefined;
+    return tile ? { x: tile[0], y: tile[1] } : null;
+  }
+
+  // Boxes only open placed in a room you own, so they need a free tile there
+  private canOpenBoxes() {
+    return !!this.room?.owner && !!this.spot();
+  }
+
+  private setPickingSpot(picking: boolean) {
+    this.pickingSpot = picking && !!this.room?.owner;
+    this.pushState();
+  }
+
+  // While choosing the tile, the click on the floor marks it instead of walking the avatar onto it
+  private onMoveAvatar(hMessage: HMessage) {
+    // Walking means being in a room: if its entry was missed, say so instead of staying quiet
+    if (!this.room && !this.roomUnknown) {
+      this.roomUnknown = true;
+      this.pushState();
+    }
+    if (!this.pickingSpot || !this.room) return;
+
+    hMessage.blocked = true;
+    const [x, y] = hMessage.getPacket().read('ii');
+    this.pickingSpot = false;
+    this.boxFailed = null;
+    this.updateSettings({ spots: { ...this.settings.spots, [this.room.id]: [x, y] } });
+  }
+
+  // ---- Prize boxes ----
+
+  private openBoxes(ids: number[]) {
+    if (!this.canOpenBoxes()) return;
+
+    const queued = new Set([...this.boxQueue, this.boxJob?.id]);
+    const fresh = ids.filter((id) => this.boxes.has(id) && !queued.has(id));
+    if (fresh.length === 0) return;
+
+    this.boxQueue.push(...fresh);
+    this.boxRun = {
+      done: this.boxRun?.done ?? 0,
+      total: (this.boxRun?.total ?? 0) + fresh.length,
+    };
+    this.boxFailed = null;
+    this.openNextBox();
+  }
+
+  // One box at a time, so every room and present answer belongs to the box being handled
+  private openNextBox() {
+    if (this.boxJob) return;
+
+    const id = this.boxQueue.shift();
+    const spot = this.spot();
+    const box = id === undefined ? undefined : this.boxes.get(id);
+    if (id === undefined || !box || !spot || !this.room?.owner) {
+      this.boxQueue = [];
+      this.boxRun = null;
+      this.pushState();
+      return;
+    }
+
+    const entry = this.newLoot();
+    entry.status = 'opening';
+
+    this.ext.sendToServer(
+      new HPacket('PlaceObject', HDirection.TOSERVER).appendString(`${box.placeId} ${spot.x} ${spot.y} 0`)
+    );
+    this.ownActionAt = Date.now();
+    this.boxJob = { id, entry, step: 'placing', timer: setTimeout(() => this.failBox('place'), BOX_STEP_TIMEOUT) };
+    this.pushState();
+  }
+
+  private onObjectAdd(hMessage: HMessage) {
+    const job = this.boxJob;
+    if (job?.step !== 'placing' || hMessage.getPacket().readInteger() !== job.id) return;
+
+    clearTimeout(job.timer);
+    job.step = 'opening';
+    job.timer = setTimeout(() => this.failBox('open'), BOX_STEP_TIMEOUT + BOX_STEP_GAP);
+    setTimeout(() => {
+      this.ext.sendToServer(new HPacket('PresentOpen', HDirection.TOSERVER).appendInt(job.id));
+      this.ownActionAt = Date.now();
+    }, BOX_STEP_GAP);
+  }
+
+  private onPresentOpened(hMessage: HMessage) {
+    const job = this.boxJob;
+    if (job?.step !== 'opening') return; // a gift the person opened in the game themselves
+
+    // Otherwise the game pops up its "you got..." window with its sound
+    hMessage.blocked = true;
+    clearTimeout(job.timer);
+    this.ownActionAt = Date.now();
+
+    const [itemType, classId, , placedId, placedType, placedInRoom] = hMessage.getPacket().read('SiSiSB');
+    const data =
+      String(itemType).toLowerCase() === 'i'
+        ? this.furniData?.getWallItemByTypeId(classId)
+        : this.furniData?.getFloorItemByTypeId(classId);
+
+    Object.assign(job.entry, {
+      status: 'opened',
+      at: Date.now(),
+      name: data?.name || '',
+      imgUrl: iconUrl(data),
+      ...this.prizeInfo(String(itemType), classId),
+    });
+    this.saveLoot();
+    this.boxes.delete(job.id);
+    if (this.boxRun) this.boxRun.done++;
+    this.pushState();
+
+    if (!placedInRoom || placedId <= 0) {
+      this.nextBox();
+      return;
+    }
+
+    // The prize lands on the box's tile: back to the inventory, so the tile is free for the next box
+    job.step = 'pickingUp';
+    job.prizeId = placedId;
+    job.timer = setTimeout(() => this.nextBox(), BOX_STEP_TIMEOUT + BOX_STEP_GAP);
+    setTimeout(() => {
+      const category = String(placedType).toLowerCase() === 'i' ? 1 : 2;
+      this.ext.sendToServer(new HPacket('PickupObject', HDirection.TOSERVER).appendInt(category).appendInt(placedId));
+      this.ownActionAt = Date.now();
+    }, BOX_STEP_GAP);
+  }
+
+  private onObjectRemove(hMessage: HMessage) {
+    const job = this.boxJob;
+    if (job?.step !== 'pickingUp' || Number(hMessage.getPacket().readString()) !== job.prizeId) return;
+    this.nextBox();
+  }
+
+  private nextBox() {
+    if (this.boxJob) clearTimeout(this.boxJob.timer);
+    this.boxJob = undefined;
+    this.boxTimer = setTimeout(() => this.openNextBox(), BOX_GAP);
+    this.pushState();
+  }
+
+  // If one box gets stuck the rest would too: stop instead of waiting on each of them
+  private failBox(step: 'place' | 'open') {
+    const job = this.boxJob;
+    if (!job) return;
+
+    // The box stays in the list of closed ones; it only gets a log line once it opens
+    this.loot = this.loot.filter((entry) => entry !== job.entry);
+    this.saveLoot();
+    this.boxJob = undefined;
+    this.boxFailed = step;
+    this.boxQueue = [];
+    this.boxRun = null;
+    this.pushState();
+  }
+
+  private stopBoxes() {
+    clearTimeout(this.boxTimer);
+    this.boxQueue = [];
+    this.boxRun = null;
+    this.pushState();
+  }
+
+  // ---- Duckets ----
+
+  private onActivityPoints(hMessage: HMessage) {
+    const packet = hMessage.getPacket();
+    const count = packet.readInteger();
+
+    for (let i = 0; i < count; i++) {
+      const [type, amount] = packet.read('ii');
+      if (type === DUCKETS) this.duckets = amount;
+    }
+    this.pushState();
+  }
+
+  private onActivityPointNotification(hMessage: HMessage) {
+    const [amount, change, type] = hMessage.getPacket().read('iii');
+    if (type !== DUCKETS) return;
+
+    this.duckets = amount;
+    // Learn what a batch costs from the change that follows it, instead of assuming a price.
+    // The game doesn't get that change: it would play the ducket sound for every batch
+    if (change < 0 && Date.now() - this.lastSentAt < COST_WINDOW) {
+      this.batchCost = -change;
+      hMessage.blocked = true;
+    }
+    this.pushState();
+  }
+
+  // ---- Settings ----
+
+  private loadSettings(): Settings {
+    try {
+      return { ...DEFAULT_SETTINGS, ...JSON.parse(readFileSync(this.settingsFile, 'utf8')) };
+    } catch {
+      return { ...DEFAULT_SETTINGS };
+    }
+  }
+
+  private updateSettings(patch: Partial<Settings>) {
+    const next = { ...this.settings };
+    if (Number.isFinite(patch.priceCap)) next.priceCap = Math.max(0, Math.floor(patch.priceCap!));
+    if (Number.isFinite(patch.defaultKeep)) next.defaultKeep = Math.max(0, Math.floor(patch.defaultKeep!));
+    if (typeof patch.autoOpen === 'boolean') next.autoOpen = patch.autoOpen;
+    if (typeof patch.hideExpensive === 'boolean') next.hideExpensive = patch.hideExpensive;
+    if (typeof patch.alwaysOnTop === 'boolean') next.alwaysOnTop = patch.alwaysOnTop;
+    if (Array.isArray(patch.locked)) next.locked = patch.locked.filter((c) => typeof c === 'string');
+    if (patch.language && LANGUAGES.includes(patch.language)) next.language = patch.language;
+    if (patch.spots && typeof patch.spots === 'object') next.spots = patch.spots;
+
+    this.settings = next;
+    this.ui.setAlwaysOnTop(next.alwaysOnTop);
+
+    try {
+      mkdirSync(path.dirname(this.settingsFile), { recursive: true });
+      writeFileSync(this.settingsFile, JSON.stringify(next, null, 2));
+    } catch (err) {
+      console.error('Could not save settings:', err);
+    }
+    this.pushState();
+  }
+
+  // ---- State for the window ----
+
+  // Many changes can land in one tick (a whole inventory fragment): send one snapshot for all of them
+  private pushState() {
+    if (this.statePending) return;
+    this.statePending = true;
+    setImmediate(() => {
+      this.statePending = false;
+      this.ui.sendState(this.snapshot());
+    });
+  }
+
+  // Names stay empty when furnidata doesn't know the furni: the window words that in its language
+  private snapshot(): AppState {
+    const cards: FurniCard[] = Array.from(this.furniture.entries())
+      .map(([typeId, furni]) => ({
+        typeId,
+        name: furni.data?.name || '',
+        imgUrl: iconUrl(furni.data),
+        quantity: furni.items.length,
+        locked: this.isLocked(furni),
+        price: this.prices.get(typeId) ?? null,
+      }))
+      .sort((a, b) => b.quantity - a.quantity || a.name.localeCompare(b.name));
+
+    const queue: QueueEntry[] = Array.from(this.queue.entries()).map(([typeId, keep]) => {
+      const furni = this.furniture.get(typeId);
+      return {
+        typeId,
+        name: furni?.data?.name || '',
+        imgUrl: iconUrl(furni?.data),
+        available: furni?.items.length ?? 0,
+        keep,
+        price: this.prices.get(typeId) ?? { status: 'loading' },
+        heldBack: this.isHeldBack(typeId),
+        allowed: this.allowed.has(typeId),
+      };
+    });
+
+    return {
+      hotel: this.hotel,
+      room: this.room ? (this.room.owner ? 'owner' : 'guest') : this.roomUnknown ? 'unknown' : 'none',
+      boxes: {
+        waiting: this.boxes.size,
+        running: !!this.boxRun,
+        done: this.boxRun?.done ?? 0,
+        total: this.boxRun?.total ?? 0,
+        failed: this.boxFailed,
+        spot: this.spot(),
+        picking: this.pickingSpot,
+      },
+      furniData: this.furniDataStatus,
+      inventory: {
+        status: this.inventoryStatus,
+        progress: this.inventoryProgress,
+        version: this.inventoryVersion,
+        cards,
+      },
+      queue,
+      recycler: {
+        ...this.recycler,
+        ...this.totals(),
+        cycleMs: this.cycleMs(),
+        nextBatch: this.nextBatch().map((item) => iconUrl(this.furniture.get(item.typeId)?.data)),
+      },
+      duckets: this.duckets,
+      batchCost: this.batchCost,
+      loot: this.loot,
+      prizeLevels: this.prizeLevels,
+      settings: this.settings,
+    };
+  }
 }
 
 new GFurniMatic();

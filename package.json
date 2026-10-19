@@ -1,18 +1,44 @@
 {
   "name": "g-furnimatic-vanilla",
   "version": "1.0.0",
+  "description": "G-Earth extension to recycle furni in bulk",
+  "author": ".Denio",
   "main": "dist/extension/main.js",
   "type": "module",
   "scripts": {
-"build": "tsc && xcopy /E /I /Y src\\renderer dist\\renderer",
-  "dev": "yarn build && concurrently \"yarn watch-main\" \"yarn electron:dev\"",
-  "watch-main": "tsc-watch --onSuccess \"electron dist/extension/main.js -- -p 9092\"",
-  "electron:dev": "echo Electron watching...",
-  "start": "electron dist/extension/main.js -- -p 9092"
+    "build": "tsc && xcopy /E /I /Y src\\renderer dist\\renderer",
+    "dev": "yarn build && concurrently \"yarn watch-main\" \"yarn electron:dev\"",
+    "watch-main": "tsc-watch --onSuccess \"electron dist/extension/main.js -- -p 9092\"",
+    "electron:dev": "echo Electron watching...",
+    "start": "electron dist/extension/main.js -- -p 9092",
+    "dist": "yarn build && electron-builder --win portable --publish never",
+    "store": "node scripts/store-bundle.mjs"
+  },
+  "build": {
+    "appId": "com.denio.gfurnimatic",
+    "productName": "G-FurniMatic",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "electronLanguages": [
+      "en-US",
+      "es"
+    ],
+    "win": {
+      "target": "portable"
+    },
+    "portable": {
+      "artifactName": "G-FurniMatic.exe"
+    }
   },
   "devDependencies": {
     "concurrently": "^9.2.0",
     "electron": "^29.0.0",
+    "electron-builder": "26.0.12",
     "rimraf": "^5.0.0",
     "tsc-watch": "^7.1.1",
     "typescript": "^5.0.0"
