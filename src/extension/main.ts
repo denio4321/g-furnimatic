@@ -107,6 +107,9 @@ const canRecycle = (item: HInventoryItem) =>
   !item.hasRentPeriodStarted &&
   (item.stuffCategory & 0xff00 & 0x100) === 0;
 
+// Diagnostics in the terminal that runs the extension (yarn start)
+const log = (...args: unknown[]) => console.log('[G-FurniMatic]', ...args);
+
 class Ui {
   public win?: BrowserWindow;
 
@@ -320,7 +323,21 @@ class GFurniMatic {
       if (this.isEcho()) hMessage.blocked = true;
     };
     on('UnseenItems', hideEcho);
-    on('NotificationDialog', hideEcho);
+    // Logged to see why the hotel refuses something; reading them must never get in the way
+    const peek = (read: () => unknown) => {
+      try {
+        return read();
+      } catch {
+        return '?';
+      }
+    };
+    on('NotificationDialog', (hMessage) => {
+      if (this.isEcho()) log('NotificationDialog after our action:', peek(() => hMessage.getPacket().readString(6)));
+      hideEcho(hMessage);
+    });
+    on('PurchaseError', (hMessage) => {
+      if (this.isEcho()) log('PurchaseError after our action, code', peek(() => hMessage.getPacket().readInteger(6)));
+    });
   }
 
   private isEcho() {
@@ -621,6 +638,9 @@ class GFurniMatic {
     this.inventoryProgress = [fragment + 1, fragments];
     if (fragment + 1 >= fragments) {
       this.inventoryStatus = 'ready';
+      const sample = [...this.furniture.values()].slice(0, 3).map((furni) => furni.items[0]);
+      log('inventory ready,', this.furniture.size, 'kinds. Sample (inventory id / furni id / type / kind):',
+        sample.map((i) => `${i.itemId} / ${i.id} / ${i.typeId} / ${i.furniType}`).join(', '));
       for (const typeId of this.queue.keys()) {
         if (this.recyclableCount(typeId) === 0) this.queue.delete(typeId);
       }
@@ -862,6 +882,7 @@ class GFurniMatic {
   // Stopping by itself (with a notice) means the run is over: worth a blink if the window is behind the game
   private stop(notice: Notice | null = null) {
     clearTimeout(this.loopTimer);
+    if (notice) log('recycling stopped:', notice.code, JSON.stringify(notice.values));
     this.recycler.running = false;
     this.recycler.notice = notice;
     // A batch already sent still gets its answer, so the inventory stays right
@@ -905,6 +926,7 @@ class GFurniMatic {
     clearTimeout(this.loopTimer);
 
     const [status, seconds] = hMessage.getPacket().read('ii');
+    log('RecyclerStatus', status, 'seconds', seconds);
     const gap = this.lastBatchAt + MIN_BATCH_GAP - Date.now();
 
     if (status === RECYCLER_OPEN) {
@@ -937,10 +959,14 @@ class GFurniMatic {
       return;
     }
 
-    // The count has to match the ids that follow it, or the hotel gets a broken packet
+    // The count has to match the ids that follow it, or the hotel gets a broken packet. Each id is the
+    // inventory's own one (the first number in FurniList), exactly what the game puts in the slots;
+    // the furni id, negated or not, doesn't match it for every item and the hotel refuses the batch
     const packet = new HPacket('RecycleItems', HDirection.TOSERVER);
     packet.appendInt(batch.length);
-    for (const item of batch) packet.appendInt(-item.id);
+    for (const item of batch) packet.appendInt(item.itemId);
+    log('RecycleItems', batch.length, 'inventory ids', batch.map((i) => i.itemId).join(','),
+      '| furni ids', batch.map((i) => i.id).join(','), '| kinds', batch.map((i) => i.furniType).join(''));
     this.ext.sendToServer(packet);
 
     this.pendingBatch = batch;
@@ -964,6 +990,8 @@ class GFurniMatic {
     this.ownActionAt = Date.now();
 
     const [status] = hMessage.getPacket().read('i');
+    const finished = hMessage.getPacket();
+    log('RecyclerFinished status', status, 'second int', finished.getBytesLength() >= 14 ? finished.readInteger(10) : 'none');
     if (status !== RECYCLE_OK) {
       this.stop(this.notice('error', 'refused'));
       return;
@@ -1060,6 +1088,7 @@ class GFurniMatic {
       if (!isPrizeBox(data) || this.boxes.has(item.id)) continue;
 
       this.boxes.set(item.id, { placeId: item.itemId });
+      log('new prize box', item.id, 'inventory id', item.itemId);
       // Ours when a batch is in flight or owes its box; one from somewhere else just waits in the list
       if (this.pendingBatch || this.boxesOwed > 0) {
         this.boxesOwed--;
@@ -1097,6 +1126,7 @@ class GFurniMatic {
 
   private onRoomEntryInfo(hMessage: HMessage) {
     const [id, owner] = hMessage.getPacket().read('iB');
+    log('RoomEntryInfo room', id, owner ? '(yours)' : '(not yours)');
     this.room = { id, owner };
     this.roomUnknown = false;
     this.boxFailed = null;
@@ -1185,6 +1215,7 @@ class GFurniMatic {
     this.ext.sendToServer(
       new HPacket('PlaceObject', HDirection.TOSERVER).appendString(`${box.placeId} ${spot.x} ${spot.y} 0`)
     );
+    log('PlaceObject box', id, `"${box.placeId} ${spot.x} ${spot.y} 0"`);
     this.ownActionAt = Date.now();
     this.boxJob = { id, entry, step: 'placing', timer: setTimeout(() => this.failBox('place'), BOX_STEP_TIMEOUT) };
     this.pushState();
@@ -1195,6 +1226,7 @@ class GFurniMatic {
     if (job?.step !== 'placing' || hMessage.getPacket().readInteger() !== job.id) return;
 
     clearTimeout(job.timer);
+    log('ObjectAdd box', job.id, 'placed, opening it');
     job.step = 'opening';
     job.timer = setTimeout(() => this.failBox('open'), BOX_STEP_TIMEOUT + BOX_STEP_GAP);
     setTimeout(() => {
@@ -1213,6 +1245,7 @@ class GFurniMatic {
     this.ownActionAt = Date.now();
 
     const [itemType, classId, , placedId, placedType, placedInRoom] = hMessage.getPacket().read('SiSiSB');
+    log('PresentOpened', itemType, classId, 'placed', placedInRoom ? `in room as ${placedType} ${placedId}` : 'in inventory');
     const data =
       String(itemType).toLowerCase() === 'i'
         ? this.furniData?.getWallItemByTypeId(classId)
@@ -1263,6 +1296,7 @@ class GFurniMatic {
   private failBox(step: 'place' | 'open') {
     const job = this.boxJob;
     if (!job) return;
+    log('box', job.id, step === 'place' ? 'was not placed (no ObjectAdd)' : 'did not open (no PresentOpened)', 'in time');
 
     // The box stays in the list of closed ones; it only gets a log line once it opens
     this.loot = this.loot.filter((entry) => entry !== job.entry);
