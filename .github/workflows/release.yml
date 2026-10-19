@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+
+      - run: yarn install --frozen-lockfile
+
+      # The tag (v1.2.3) is the source of truth: it ends up in the exe metadata and in what G-Earth shows
+      - name: Set version from tag
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          node -e "
+            const fs = require('fs');
+            for (const file of ['package.json', 'src/extension/extension.json']) {
+              const json = JSON.parse(fs.readFileSync(file, 'utf8'));
+              json.version = process.env.VERSION.replace(/^v/, '');
+              fs.writeFileSync(file, JSON.stringify(json, null, 2) + '\n');
+            }
+          "
+
+      - run: yarn dist
+
+      - name: Build store bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: yarn store
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          assets=(release/G-FurniMatic.exe)
+          [ -f release/G-FurniMatic-store.zip ] && assets+=(release/G-FurniMatic-store.zip)
+          gh release create "${{ github.ref_name }}" "${assets[@]}" --title "${{ github.ref_name }}" --generate-notes
